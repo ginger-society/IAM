@@ -43,7 +43,7 @@ spec:
         - name: binaries_to_build
           value: "$(params.binaries_to_build)"
 
-    - name: push-bucket-service-image
+    - name: push-iam-service-image
       runAfter:
         - build-amd64-linux
       taskRef:
@@ -75,7 +75,7 @@ spec:
 
     - name: notify-version-update
       runAfter:
-        - push-bucket-service-image
+        - push-iam-service-image
       taskSpec:
         steps:
           - name: echo
