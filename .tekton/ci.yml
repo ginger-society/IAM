@@ -1,103 +1,85 @@
 apiVersion: tekton.dev/v1beta1
-kind: Task
+kind: Pipeline
 metadata:
-  name: build-image-and-push-to-container-registry
-  namespace: tasks-ginger-iam-service
+  name: build-pipeline
   annotations:
-    x-ginger-task-namespace: "ginger-iam-service"  # Custom annotation
-    x-ginger-task-trigger-branch: '["refs/heads/main"]'  # Allowed branches
-
+    x-gitter-trigger-branch: '["refs/heads/main", "refs/heads/dev-*"]'
+    x-gitter-enabled: "true"
 spec:
-  workspaces:
-      - name: source
-      - name: ssh-credentials  # Store SSH keys
-      - name: ssh-config  # Store SSH setup
-      - name: kubeconfig
-      - name: buildah-cache  # Workspace for caching
-      - name: pipeline-secrets
-      - name: general-purpose-cache
-  steps:
-    - name: clone
-      image: containers.gingersociety.org/secure-git-task-runner:latest
-      script: |
-        #!/bin/sh
-        set -e  # Exit on error
+  params:
+    - name: image_tag
+      type: string
+    - name: binaries_to_build
+      type: string
+      default: "IAMService"
 
-        /usr/local/bin/configurator.sh
-        
-        git config --global init.defaultBranch main
-        git clone git@source.gingersociety.org:ginger-iam-service.git /workspace/source/repo
-        echo "Repository cloned successfully."
+  tasks:
+    - name: ginger-connector-setup
+      runAfter:
+        - clone
+      taskRef:
+        resolver: cluster
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: ginger-connector-setup
+          - name: namespace
+            value: default
 
-    - name: build
-      image: containers.gingersociety.org/enhanced-buildah:latest
-      script: |
-        #!/bin/sh
-        set -e  # Exit on error
-        
-        /usr/local/bin/configurator_buildah.sh
-        
-        echo "Loading secrets from workspace..."
-        export DOCKER_USERNAME=$(cat /workspace/pipeline-secrets/DOCKER_USERNAME)
-        export DOCKER_PASSWORD=$(cat /workspace/pipeline-secrets/DOCKER_PASSWORD)
-        export GINGER_TOKEN=$(cat /workspace/pipeline-secrets/GINGER_TOKEN)
-        
-        echo "Logging into container registry..."
-        echo "$DOCKER_PASSWORD" | buildah login --username "$DOCKER_USERNAME" --password-stdin containers.gingersociety.org
-        
-        # Set up Cargo and target cache directories
-        mkdir -p /workspace/general-purpose-cache/target
-        mkdir -p /workspace/general-purpose-cache/cargo
+    - name: build-amd64-linux
+      runAfter:
+        - ginger-connector-setup
+      taskRef:
+        resolver: cluster
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: build-amd64-linux
+          - name: namespace
+            value: default
+      params:
+        - name: binaries_to_build
+          value: "$(params.binaries_to_build)"
 
-        cd /workspace/source/repo
-        echo "Building db runtime image with Buildah"
-        buildah bud \
-          --build-arg GINGER_TOKEN=$GINGER_TOKEN \
-          --volume /workspace/general-purpose-cache/cargo:/usr/local/cargo/registry:Z \
-          --volume /workspace/general-purpose-cache/target:/app/target:Z \
-          --isolation=chroot \
-          --storage-driver=vfs \
-          -f Dockerfile.builder \
-          --root=$CONTAINERS_STORAGE \
-          .
+    - name: push-bucket-service-image
+      runAfter:
+        - build-amd64-linux
+      taskRef:
+        resolver: cluster
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: build-and-push-image
+          - name: namespace
+            value: default
+      params:
+        - name: image_tag
+          value: "$(params.image_tag)"
+        - name: org_id
+          value: "$(params.org_id)"
+        - name: image_name
+          value: "iam-service"
+        - name: binary_name
+          value: "IAMService"
+        - name: entrypoint
+          value: '"/usr/local/bin/IAMService"'
+        - name: base_image
+          value: "docker.io/gingersociety/rust-rocket-api-runner:latest"
+        - name: extra_copy_src
+          value: "./Rocket.toml"
+        - name: extra_copy_dest
+          value: "/Rocket.toml"
 
-        buildah bud \
-          --volume /workspace/general-purpose-cache/target:/app/target:Z \
-          --isolation=chroot \
-          --storage-driver=vfs \
-          -t containers.gingersociety.org/gingersociety/iam-service:latest \
-          -f Dockerfile.runner \
-          --root=$CONTAINERS_STORAGE \
-          .
-        
-        buildah push containers.gingersociety.org/gingersociety/iam-service:latest
-
-      securityContext:
-        privileged: true
-
-    - name: restart-deployment
-      image: containers.gingersociety.org/secure-git-task-runner:latest
-      script: |
-        #!/bin/sh
-        set -e
-        echo "🔹 Setting KUBECONFIG..."
-        cp -r /workspace/kubeconfig /keys
-        export KUBECONFIG=/workspace/kubeconfig/kubeconfig.gingersociety.prod.yml
-        echo "Rolling out restart"
-        kubectl rollout restart deployment iam-service-api-deployment \
-          -n default
-
-        sleep 5
-
-        curl -X 'POST' \
-          'https://api.gingersociety.org/notification/groups/43c6ba1f-a17f-4eb3-b4d8-7a3e565abc8d/publish' \
-          -H 'accept: */*' \
-          -H 'X-ISC-API-Authorization: eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJOb3RpZmljYXRpb25TZXJ2aWNlIiwiZXhwIjoxNzc3MjExMjI0LCJvcmdfaWQiOiJnaW5nZXItc29jaWV0eSIsInNjb3BlcyI6W119.lLKGMITmzzC7kL1w_WF3SqWp875SGimGAzDEEMQ61WM' \
-          -H 'Content-Type: application/json' \
-          -d '{
-          "message": "@ginger-society/IAMService",
-          "prefix": "workspace",
-          "pubType": "Group"
-        }'
-
-
+    - name: notify-version-update
+      runAfter:
+        - push-bucket-service-image
+      taskSpec:
+        steps:
+          - name: echo
+            image: alpine
+            script: |
+              #!/bin/sh
+              echo "Hello World - all previous tasks are done!"
