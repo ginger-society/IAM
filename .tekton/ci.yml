@@ -92,7 +92,7 @@ spec:
         - name: deployment_name
           value: "iamservice"
         - name: kube_context
-          value: "artifactory"
+          value: "gingersociety"
 
     - name: ginger-connector-publish
       runAfter:
