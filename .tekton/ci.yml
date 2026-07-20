@@ -3,8 +3,8 @@ kind: Pipeline
 metadata:
   name: build-pipeline
   annotations:
-    x-gitter-trigger-branch: '["refs/heads/main", "refs/heads/dev-*"]'
     x-gitter-enabled: "true"
+    x-gitter-load-ephemeral-env-kubeconfig: "true"
 spec:
   params:
     - name: image_tag
@@ -73,9 +73,46 @@ spec:
         - name: extra_copy_dest
           value: "/Rocket.toml"
 
-    - name: notify-version-update
+    - name: restart-iam-service
       runAfter:
         - push-iam-service-image
+      workspaces:
+        - name: ephemeral-kubeconfig
+          workspace: ephemeral-kubeconfig
+      taskRef:
+        resolver: cluster
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: restart-deployment
+          - name: namespace
+            value: default
+      params:
+        - name: deployment_name
+          value: "iamservice"
+        - name: kube_context
+          value: "artifactory"
+
+    - name: ginger-connector-publish
+      runAfter:
+        - restart-iam-service
+      taskRef:
+        resolver: cluster
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: ginger-connector-publish
+          - name: namespace
+            value: default
+      params:
+        - name: environment
+          value: "prod"
+
+    - name: notify-version-update
+      runAfter:
+        - ginger-connector-publish
       taskSpec:
         steps:
           - name: echo
