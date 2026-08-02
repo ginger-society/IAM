@@ -1113,7 +1113,7 @@ pub async fn request_password_reset(
             email_request: EmailRequest {
                 to: request.email_id.clone(),
                 subject: "Password Reset".to_string(),
-                message: format!("Use this link(expires within 5 minutes) to reset your password: https://iam-staging.gingersociety.org/#/{}/reset-password/{}", request.app_id, token_value),
+                message: format!("Use this link(expires within 5 minutes) to reset your password: https://iam.gingersociety.org/#/{}/reset-password/{}", request.app_id, token_value),
                 reply_to: None,
             },
         },
