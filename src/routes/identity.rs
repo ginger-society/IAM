@@ -14,13 +14,16 @@ use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, 
 use r2d2_redis::redis::Commands;
 use r2d2_redis::RedisConnectionManager;
 use rand::Rng;
-use rocket::http::Status;
-use rocket::response::status;
+use rocket::http::{ContentType, Status};
+use rocket::response::{self, status, Responder};
 use rocket::serde::json::Json;
-use rocket::{post, State};
+use rocket::{post, Request, State};
 use rocket_okapi::openapi;
+use schemars::JsonSchema;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::env;
+use std::io::Cursor;
 use NotificationService::apis::configuration::ApiKey as NotificationApiKey;
 use NotificationService::apis::default_api::{send_email, SendEmailParams};
 use NotificationService::get_configuration as get_notification_service_configuration;
@@ -52,13 +55,166 @@ use p256::pkcs8::DecodePrivateKey;
 use sha2::{Digest, Sha256};
 use base32::Alphabet;
 use spki::EncodePublicKey;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sec1::DecodeEcPrivateKey;
 use crate::models::request::DockerAccess;
 use p256::pkcs8::EncodePrivateKey;
 
-// ── Shared structs for docker token─────────────────────────────────────────────────────────────
+// ============================================================================
+// Shared, descriptive JSON error type — mirrors the ApiError used in the
+// dbschema/services router so both services return a consistent error shape:
+//   { "error": true, "message": "<handler>: <what failed>" }
+//
+// Every handler below returns `ApiError` instead of a bare `rocket::http::
+// Status` (no body) or `status::Custom<String>` (plain text, inconsistent
+// shape). This also means the underlying diesel/redis/bcrypt/jwt error is
+// preserved in the message and logged server-side via eprintln!, instead of
+// being discarded by `.map_err(|_| Status::X)` or crashing the worker via
+// `.expect()` / `.unwrap()`.
+//
+// If you have multiple route files, consider moving this into a shared
+// `src/errors.rs` module instead of duplicating it per file.
+// ============================================================================
 
+#[derive(Serialize, JsonSchema)]
+pub struct ApiError {
+    pub error: bool,
+    pub message: String,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub status_code: u16,
+}
+
+impl ApiError {
+    /// Build a new ApiError. `context` should be `"handler_name: what failed"`,
+    /// e.g. `"login: verifying password"`.
+    pub fn new(status: Status, context: &str) -> Self {
+        ApiError {
+            error: true,
+            message: context.to_string(),
+            status_code: status.code,
+        }
+    }
+
+    /// Build an ApiError from a lower-level error (diesel, redis, bcrypt,
+    /// jwt, serde_json, etc.), logging the raw debug output server-side and
+    /// returning a descriptive (but not internals-leaking) message.
+    pub fn from_err<E: std::fmt::Debug>(status: Status, context: &str, err: E) -> Self {
+        eprintln!("[ERROR] {} -> {:?}", context, err);
+        ApiError {
+            error: true,
+            message: format!("{}: {:?}", context, err),
+            status_code: status.code,
+        }
+    }
+
+    pub fn not_found(context: &str) -> Self {
+        Self::new(Status::NotFound, context)
+    }
+
+    pub fn unauthorized(context: &str) -> Self {
+        Self::new(Status::Unauthorized, context)
+    }
+
+    pub fn forbidden(context: &str) -> Self {
+        Self::new(Status::Forbidden, context)
+    }
+
+    pub fn bad_request(context: &str) -> Self {
+        Self::new(Status::BadRequest, context)
+    }
+
+    pub fn conflict(context: &str) -> Self {
+        Self::new(Status::Conflict, context)
+    }
+
+    pub fn service_unavailable(context: &str) -> Self {
+        Self::new(Status::ServiceUnavailable, context)
+    }
+
+    pub fn internal<E: std::fmt::Debug>(context: &str, err: E) -> Self {
+        Self::from_err(Status::InternalServerError, context, err)
+    }
+}
+
+impl<'r> Responder<'r, 'static> for ApiError {
+    fn respond_to(self, _req: &'r Request<'_>) -> response::Result<'static> {
+        let status = Status::from_code(self.status_code).unwrap_or(Status::InternalServerError);
+        let body = serde_json::to_string(&self)
+            .unwrap_or_else(|_| "{\"error\":true,\"message\":\"Unknown error\"}".to_string());
+        rocket::Response::build()
+            .status(status)
+            .header(ContentType::JSON)
+            .sized_body(body.len(), Cursor::new(body))
+            .ok()
+    }
+}
+
+use rocket_okapi::gen::OpenApiGenerator;
+use rocket_okapi::okapi::openapi3::{RefOr, Response as OpenApiResponse, Responses};
+use rocket_okapi::response::OpenApiResponderInner;
+use rocket_okapi::OpenApiError;
+
+impl OpenApiResponderInner for ApiError {
+    fn responses(gen: &mut OpenApiGenerator) -> Result<Responses, OpenApiError> {
+        let mut responses = Responses::default();
+
+        let schema = gen.json_schema::<ApiError>();
+        let response = OpenApiResponse {
+            description: "An error occurred".to_string(),
+            content: {
+                let mut content = okapi::map! {};
+                content.insert(
+                    "application/json".to_string(),
+                    rocket_okapi::okapi::openapi3::MediaType {
+                        schema: Some(schema),
+                        ..Default::default()
+                    },
+                );
+                content
+            },
+            ..Default::default()
+        };
+
+        for code in ["400", "401", "403", "404", "409", "500", "503"] {
+            responses
+                .responses
+                .insert(code.to_string(), RefOr::Object(response.clone()));
+        }
+
+        Ok(responses)
+    }
+}
+
+// Small helpers: get a DB / Redis connection or return a descriptive,
+// consistent error instead of `.expect()`-panicking the worker thread.
+fn get_conn(
+    rdb: &State<Pool<ConnectionManager<PgConnection>>>,
+    context: &str,
+) -> Result<diesel::r2d2::PooledConnection<ConnectionManager<PgConnection>>, ApiError> {
+    rdb.get().map_err(|e| {
+        ApiError::from_err(
+            Status::ServiceUnavailable,
+            &format!("{}: failed to get DB connection", context),
+            e,
+        )
+    })
+}
+
+fn get_cache_conn(
+    cache: &State<Pool<RedisConnectionManager>>,
+    context: &str,
+) -> Result<diesel::r2d2::PooledConnection<RedisConnectionManager>, ApiError> {
+    cache.get().map_err(|e| {
+        ApiError::from_err(
+            Status::ServiceUnavailable,
+            &format!("{}: failed to get Redis connection", context),
+            e,
+        )
+    })
+}
+
+// ── Shared structs for docker token ─────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
 struct DockerTokenClaims {
@@ -72,70 +228,73 @@ struct DockerTokenClaims {
     access: Vec<DockerAccess>,
 }
 
-
-
 #[openapi()]
 #[post("/change-password", data = "<change_password_request>")]
 pub fn change_password(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     change_password_request: Json<ChangePasswordRequest>,
-) -> status::Custom<Json<MessageResponse>> {
+) -> Result<Json<MessageResponse>, ApiError> {
     use crate::models::schema::schema::user::dsl::*;
 
-    let mut conn = rdb.get().expect("Failed to get DB connection");
+    let mut conn = get_conn(rdb, "change_password")?;
 
-    let u: User = match user
+    let u: User = user
         .filter(email_id.eq(&change_password_request.email))
         .first(&mut conn)
-    {
-        Ok(u) => u,
-        Err(_) => {
-            return status::Custom(
+        .map_err(|e| {
+            ApiError::from_err(
                 Status::NotFound,
-                Json(MessageResponse {
-                    message: "User not found".to_string(),
-                }),
+                &format!(
+                    "change_password: user with email '{}' not found",
+                    change_password_request.email
+                ),
+                e,
             )
-        }
-    };
+        })?;
 
-    let valid = verify(
-        &change_password_request.current_password,
-        u.password_hash.as_ref().unwrap(),
-    )
-    .expect("Failed to verify password");
+    let hash_val = u.password_hash.as_ref().ok_or_else(|| {
+        ApiError::internal(
+            &format!("change_password: user '{}' has no password hash set", u.email_id),
+            "password_hash column was NULL",
+        )
+    })?;
+
+    let valid = verify(&change_password_request.current_password, hash_val).map_err(|e| {
+        ApiError::internal(
+            &format!("change_password: bcrypt verify for user '{}'", u.email_id),
+            e,
+        )
+    })?;
 
     if !valid {
-        return status::Custom(
-            Status::Unauthorized,
-            Json(MessageResponse {
-                message: "Current password is incorrect".to_string(),
-            }),
-        );
+        return Err(ApiError::unauthorized(&format!(
+            "change_password: current password incorrect for user '{}'",
+            u.email_id
+        )));
     }
 
-    let new_hashed_password =
-        hash(&change_password_request.new_password, DEFAULT_COST).expect("Failed to hash password");
+    let new_hashed_password = hash(&change_password_request.new_password, DEFAULT_COST)
+        .map_err(|e| ApiError::internal("change_password: hashing new password", e))?;
 
     let updated_rows = update(user.filter(email_id.eq(&change_password_request.email)))
         .set(password_hash.eq(Some(new_hashed_password)))
         .execute(&mut conn)
-        .expect("Error updating password");
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("change_password: updating password for user '{}'", u.email_id),
+                e,
+            )
+        })?;
 
     if updated_rows > 0 {
-        status::Custom(
-            Status::Ok,
-            Json(MessageResponse {
-                message: "Password updated successfully".to_string(),
-            }),
-        )
+        Ok(Json(MessageResponse {
+            message: "Password updated successfully".to_string(),
+        }))
     } else {
-        status::Custom(
-            Status::InternalServerError,
-            Json(MessageResponse {
-                message: "Failed to update password".to_string(),
-            }),
-        )
+        Err(ApiError::internal(
+            &format!("change_password: update touched 0 rows for user '{}'", u.email_id),
+            "expected 1 row to be updated",
+        ))
     }
 }
 
@@ -145,34 +304,36 @@ pub async fn register(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     cache: &State<Pool<RedisConnectionManager>>,
     register_request: Json<RegisterRequest>,
-) -> Result<Json<String>, Status> {
+) -> Result<Json<String>, ApiError> {
     use crate::models::schema::schema::user::dsl::*;
 
-    let mut conn = rdb.get().expect("Failed to get DB connection");
+    let mut conn = get_conn(rdb, "register")?;
+    let mut cache_connection = get_cache_conn(cache, "register")?;
 
-    let mut cache_connection = match cache.get() {
-        Ok(conn) => conn,
-        Err(err) => {
-            error!("Failed to get Redis connection: {}", err);
-            return Err(rocket::http::Status::ServiceUnavailable);
-        }
-    };
-
-    // Check if the user with the same email already exists
     let existing_user = user
         .filter(email_id.eq(&register_request.email))
         .first::<User>(&mut conn)
         .optional()
-        .map_err(|_| Status::InternalServerError)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!(
+                    "register: checking for existing user with email '{}'",
+                    register_request.email
+                ),
+                e,
+            )
+        })?;
 
-    if let Some(_) = existing_user {
-        return Err(Status::Conflict);
+    if existing_user.is_some() {
+        return Err(ApiError::conflict(&format!(
+            "register: a user with email '{}' already exists",
+            register_request.email
+        )));
     }
 
-    let hashed_password =
-        hash(&register_request.password, DEFAULT_COST).expect("Failed to hash password");
+    let hashed_password = hash(&register_request.password, DEFAULT_COST)
+        .map_err(|e| ApiError::internal("register: hashing password", e))?;
 
-    // Generate a random hash value
     let registration_token_value: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(30)
@@ -181,21 +342,27 @@ pub async fn register(
 
     let registration_cache_value = RegisterRequestValue {
         email: register_request.email.clone(),
-        hashed_password: hashed_password,
+        hashed_password,
     };
 
-    // Insert the user registration data into the cache
+    let serialized = serde_json::to_string(&registration_cache_value).map_err(|e| {
+        ApiError::internal("register: serializing pending registration payload", e)
+    })?;
+
     let _: () = cache_connection
-        .set_ex(
-            &registration_token_value,
-            serde_json::to_string(&registration_cache_value).unwrap(),
-            300,
-        ) // Token expires in 1 hour
-        .map_err(|_| rocket::http::Status::InternalServerError)?;
+        .set_ex(&registration_token_value, serialized, 300) // Token expires in 5 minutes
+        .map_err(|e| {
+            ApiError::internal(
+                "register: caching pending registration token",
+                e,
+            )
+        })?;
 
     let mut configuration = get_notification_service_configuration();
 
-    let token_str = env::var("ISC_SECRET").expect("ISC_SECRET must be set");
+    let token_str = env::var("ISC_SECRET").map_err(|e| {
+        ApiError::internal("register: reading ISC_SECRET env var", e)
+    })?;
 
     configuration.api_key = Some(NotificationApiKey {
         key: token_str,
@@ -212,15 +379,15 @@ pub async fn register(
                     reply_to: None,
                 },
             },
-        ).await{
-            Ok(_) => {
-                Ok(Json(
-                    "User registration request generated successfully".to_string(),
-                ))
-            }Err(e) => {
-                println!("Error while sending mail : {:?}" , e);
-                Err(Status::ServiceUnavailable)
-            }
+        ).await {
+            Ok(_) => Ok(Json(
+                "User registration request generated successfully".to_string(),
+            )),
+            Err(e) => Err(ApiError::from_err(
+                Status::ServiceUnavailable,
+                &format!("register: sending confirmation email to '{}'", register_request.email),
+                e,
+            )),
         }
 }
 
@@ -230,32 +397,44 @@ pub fn registeration_confirmation(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     cache: &State<Pool<RedisConnectionManager>>,
     registration_token: String,
-) -> Result<Json<String>, Status> {
+) -> Result<Json<String>, ApiError> {
     use crate::models::schema::schema::user::dsl::*;
 
-    let mut conn = rdb.get().expect("Failed to get DB connection");
+    let mut conn = get_conn(rdb, "registeration_confirmation")?;
+    let mut cache_connection = get_cache_conn(cache, "registeration_confirmation")?;
 
-    let mut cache_connection = cache
-        .get()
-        .map_err(|_| rocket::http::Status::ServiceUnavailable)?;
+    let user_data: String = cache_connection.get(&registration_token).map_err(|e| {
+        ApiError::from_err(
+            Status::NotFound,
+            &format!(
+                "registeration_confirmation: registration token '{}' not found or expired",
+                registration_token
+            ),
+            e,
+        )
+    })?;
 
-    // Get user ID from cache using the token
-    let user_data: String = cache_connection
-        .get(&registration_token)
-        .map_err(|_| rocket::http::Status::NotFound)?;
+    // Remove the token from cache after reading (best-effort; log but don't
+    // fail the confirmation if cleanup fails).
+    if let Err(e) = cache_connection.del::<_, ()>(&registration_token) {
+        eprintln!(
+            "[WARN] registeration_confirmation: failed to delete used token '{}' -> {:?}",
+            registration_token, e
+        );
+    }
 
-    // Remove the token from cache after reading
-    cache_connection
-        .del::<_, ()>(&registration_token)
-        .map_err(|_| Status::InternalServerError)?;
-
-    let register_request: RegisterRequestValue = serde_json::from_str(&user_data).unwrap();
+    let register_request: RegisterRequestValue = serde_json::from_str(&user_data).map_err(|e| {
+        ApiError::internal(
+            "registeration_confirmation: deserializing cached registration payload",
+            e,
+        )
+    })?;
 
     let new_user = UserInsertable {
         first_name: None,
         last_name: None,
         middle_name: None,
-        email_id: register_request.email,
+        email_id: register_request.email.clone(),
         mobile_number: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -267,10 +446,19 @@ pub fn registeration_confirmation(
     insert_into(user)
         .values(&new_user)
         .execute(&mut conn)
-        .expect("Error inserting new user");
+        .map_err(|e| {
+            ApiError::internal(
+                &format!(
+                    "registeration_confirmation: inserting new user '{}'",
+                    register_request.email
+                ),
+                e,
+            )
+        })?;
 
     Ok(Json("User registered successfully".to_string()))
 }
+
 fn user_has_access_to_app(
     conn: &mut PgConnection,
     app_id: &String,
@@ -287,24 +475,18 @@ fn user_has_access_to_app(
     {
         Ok(app) => app,
         Err(_) => {
-            println!("App does not exist or is disabled: {}", app_id);
+            eprintln!("[user_has_access_to_app] app does not exist or is disabled: {}", app_id);
             return Ok(false);
         }
     };
-
-    println!("User groups: {:?}", user_groups);
 
     let group_ids: Vec<i64> = user_groups
         .iter()
         .filter_map(|group| group.parse::<i64>().ok())
         .collect();
 
-    // Step 1: Check if app.group_id is NULL
+    // Step 1: Check if app.group_id is NULL (public app)
     if app.group_id.is_none() {
-        println!(
-            "App is accessible as it has no group associated: {}",
-            app_id
-        );
         return Ok(true);
     }
 
@@ -321,15 +503,8 @@ fn user_has_access_to_app(
         .first::<i64>(conn)
         .optional()?;
 
-    if accessible_app_exists.is_some() {
-        println!("App is accessible based on group membership: {}", app_id);
-        Ok(true)
-    } else {
-        println!("App is not accessible for the user: {}", app_id);
-        Ok(false)
-    }
+    Ok(accessible_app_exists.is_some())
 }
-
 
 #[openapi()]
 #[post("/login", data = "<login_request>")]
@@ -337,69 +512,60 @@ pub fn login(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     login_request: Json<LoginRequest>,
     cache_pool: &State<Pool<RedisConnectionManager>>,
-) -> Result<Json<IAMLoginResponse>, rocket::http::Status> {
+) -> Result<Json<IAMLoginResponse>, ApiError> {
     use crate::models::schema::schema::user::dsl::*;
     use bcrypt::verify;
 
-    println!("[login] attempt for email: {}", login_request.email);
-
-    let mut conn = rdb
-        .get()
-        .map_err(|e| {
-            eprintln!("[login] ✗ failed to get DB connection: {}", e);
-            rocket::http::Status::ServiceUnavailable
-        })?;
-
-    let mut cache_connection = cache_pool
-        .get()
-        .map_err(|e| {
-            eprintln!("[login] ✗ failed to get Redis connection: {}", e);
-            rocket::http::Status::ServiceUnavailable
-        })?;
+    let mut conn = get_conn(rdb, "login")?;
+    let mut cache_connection = get_cache_conn(cache_pool, "login")?;
 
     // Fetch the user by email
     let u: User = user
         .filter(email_id.eq(&login_request.email))
         .first(&mut conn)
         .map_err(|e| {
-            eprintln!("[login] ✗ user not found for email '{}': {}", login_request.email, e);
-            rocket::http::Status::Unauthorized
+            ApiError::from_err(
+                Status::Unauthorized,
+                &format!("login: user not found for email '{}'", login_request.email),
+                e,
+            )
         })?;
-
-    println!("[login] ✓ user found: id={} email={}", u.id, u.email_id);
 
     // Check password hash is present
-    if u.password_hash.is_none() {
-        eprintln!("[login] ✗ user {} has no password hash set", u.email_id);
-        return Err(rocket::http::Status::Unauthorized);
-    }
+    let hash_val = u.password_hash.as_ref().ok_or_else(|| {
+        ApiError::unauthorized(&format!(
+            "login: user '{}' has no password hash set",
+            u.email_id
+        ))
+    })?;
 
     // Verify the password
-    let valid = verify(&login_request.password, u.password_hash.as_ref().unwrap())
-        .map_err(|e| {
-            eprintln!("[login] ✗ bcrypt verify error for user {}: {}", u.email_id, e);
-            rocket::http::Status::Unauthorized
-        })?;
+    let valid = verify(&login_request.password, hash_val).map_err(|e| {
+        ApiError::from_err(
+            Status::Unauthorized,
+            &format!("login: bcrypt verify error for user '{}'", u.email_id),
+            e,
+        )
+    })?;
 
     if !valid {
-        eprintln!("[login] ✗ invalid password for user {}", u.email_id);
-        return Err(rocket::http::Status::Unauthorized);
+        return Err(ApiError::unauthorized(&format!(
+            "login: invalid password for user '{}'",
+            u.email_id
+        )));
     }
-
-    println!("[login] ✓ password verified for user {}", u.email_id);
 
     // Fetch user_groups from cache or database
     let cache_key = format!("user_groups:{}", u.id);
     let user_groups: Vec<String> = match cache_connection.get::<_, Option<String>>(&cache_key) {
-        Ok(Some(cached_groups)) => {
-            println!("[login] ✓ user_groups cache hit for user {}", u.id);
-            serde_json::from_str(&cached_groups).unwrap_or_else(|e| {
-                eprintln!("[login] ✗ failed to deserialize cached groups: {}", e);
-                vec![]
-            })
-        }
+        Ok(Some(cached_groups)) => serde_json::from_str(&cached_groups).unwrap_or_else(|e| {
+            eprintln!(
+                "[WARN] login: failed to deserialize cached groups for user {} -> {:?}",
+                u.id, e
+            );
+            vec![]
+        }),
         Ok(None) => {
-            println!("[login] user_groups cache miss for user {} — querying DB", u.id);
             use crate::models::schema::schema::group::dsl as group_dsl;
             use crate::models::schema::schema::group_users::dsl as gu_dsl;
 
@@ -408,39 +574,38 @@ pub fn login(
                 .filter(gu_dsl::user_id.eq(u.id))
                 .select(group_dsl::identifier)
                 .load(&mut conn)
-                .unwrap_or_else(|e| {
-                    eprintln!("[login] ✗ failed to load groups from DB for user {}: {}", u.id, e);
-                    vec![]
-                });
-
-            println!("[login] ✓ user {} groups from DB: {:?}", u.id, groups_from_db);
+                .map_err(|e| {
+                    ApiError::internal(
+                        &format!("login: loading groups from DB for user {}", u.id),
+                        e,
+                    )
+                })?;
 
             let groups_json = serde_json::to_string(&groups_from_db).unwrap_or_default();
-            let _: () = cache_connection
-                .set_ex(&cache_key, groups_json, 3600)
-                .unwrap_or(());
+            if let Err(e) = cache_connection.set_ex::<_, _, ()>(&cache_key, groups_json, 3600) {
+                eprintln!(
+                    "[WARN] login: failed to cache user_groups for user {} -> {:?}",
+                    u.id, e
+                );
+            }
 
             groups_from_db
         }
         Err(e) => {
-            eprintln!("[login] ✗ Redis error fetching user_groups for user {}: {}", u.id, e);
+            eprintln!(
+                "[WARN] login: Redis error fetching user_groups for user {} -> {:?}",
+                u.id, e
+            );
             vec![]
         }
     };
 
-    println!("[login] user {} is in groups: {:?}", u.id, user_groups);
-
     // Determine app_id for Redis cache
     let app_id = login_request.client_id.clone();
-    println!("[login] client_id: {:?}", app_id);
 
     let app_tokens = if let Some(app_id) = &app_id {
-        println!("[login] checking access for app_id: {}", app_id);
-
         match user_has_access_to_app(&mut conn, app_id, &user_groups) {
             Ok(true) => {
-                println!("[login] ✓ user {} has access to app {}", u.email_id, app_id);
-
                 let access_token = create_jwt(
                     &u.email_id,
                     &u.id.to_string(),
@@ -449,7 +614,7 @@ pub fn login(
                     &u.last_name,
                     &u.middle_name,
                     &Some(app_id.clone()),
-                );
+                )?;
                 let refresh_token = create_jwt(
                     &u.email_id,
                     &u.id.to_string(),
@@ -458,7 +623,7 @@ pub fn login(
                     &u.last_name,
                     &u.middle_name,
                     &Some(app_id.clone()),
-                );
+                )?;
 
                 let session_data_with_app = json!({
                     "user_id": u.id,
@@ -471,8 +636,10 @@ pub fn login(
                         3600,
                     )
                     .map_err(|e| {
-                        eprintln!("[login] ✗ failed to cache session for app {}: {}", app_id, e);
-                        rocket::http::Status::InternalServerError
+                        ApiError::internal(
+                            &format!("login: caching app session for app '{}'", app_id),
+                            e,
+                        )
                     })?;
 
                 Some(LoginResponse {
@@ -481,22 +648,22 @@ pub fn login(
                 })
             }
             Ok(false) => {
-                eprintln!(
-                    "[login] ✗ user {} does not have access to app {} — groups: {:?}",
+                return Err(ApiError::forbidden(&format!(
+                    "login: user '{}' does not have access to app '{}' (groups: {:?})",
                     u.email_id, app_id, user_groups
-                );
-                return Err(rocket::http::Status::Forbidden);
+                )));
             }
             Err(e) => {
-                eprintln!(
-                    "[login] ✗ error checking app access for user {} / app {}: {}",
-                    u.email_id, app_id, e
-                );
-                return Err(rocket::http::Status::InternalServerError);
+                return Err(ApiError::internal(
+                    &format!(
+                        "login: checking app access for user '{}' / app '{}'",
+                        u.email_id, app_id
+                    ),
+                    e,
+                ));
             }
         }
     } else {
-        println!("[login] no client_id provided — skipping app token generation");
         None
     };
 
@@ -509,7 +676,7 @@ pub fn login(
         &u.last_name,
         &u.middle_name,
         &None,
-    );
+    )?;
     let refresh_token_without_app = create_jwt(
         &u.email_id,
         &u.id.to_string(),
@@ -518,11 +685,9 @@ pub fn login(
         &u.last_name,
         &u.middle_name,
         &None,
-    );
+    )?;
 
-    let session_data_without_app = json!({
-        "user_id": u.id,
-    });
+    let session_data_without_app = json!({ "user_id": u.id });
     let _: () = cache_connection
         .set_ex(
             refresh_token_without_app.clone(),
@@ -530,11 +695,11 @@ pub fn login(
             3600,
         )
         .map_err(|e| {
-            eprintln!("[login] ✗ failed to cache iam session: {}", e);
-            rocket::http::Status::InternalServerError
+            ApiError::internal(
+                &format!("login: caching base IAM session for user '{}'", u.email_id),
+                e,
+            )
         })?;
-
-    println!("[login] ✓ login successful for user {}", u.email_id);
 
     Ok(Json(IAMLoginResponse {
         app_tokens,
@@ -551,13 +716,11 @@ pub fn refresh_token(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     refresh_request: Json<RefreshTokenRequest>,
     cache_pool: &State<Pool<RedisConnectionManager>>,
-) -> Result<Json<RefreshTokenResponse>, rocket::http::Status> {
-    let mut cache_connection = cache_pool
-        .get()
-        .map_err(|_| rocket::http::Status::ServiceUnavailable)?;
+) -> Result<Json<RefreshTokenResponse>, ApiError> {
+    let mut cache_connection = get_cache_conn(cache_pool, "refresh_token")?;
 
-    // Decode the refresh token
-    let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let secret = env::var("JWT_SECRET")
+        .map_err(|e| ApiError::internal("refresh_token: reading JWT_SECRET env var", e))?;
     let decoding_key = DecodingKey::from_secret(secret.as_ref());
 
     let token_data = decode::<Claims>(
@@ -565,23 +728,29 @@ pub fn refresh_token(
         &decoding_key,
         &Validation::new(Algorithm::HS256),
     )
-    .map_err(|_| rocket::http::Status::Unauthorized)?;
+    .map_err(|e| {
+        ApiError::from_err(Status::Unauthorized, "refresh_token: decoding refresh token", e)
+    })?;
 
-    // Verify the token type
     if token_data.claims.token_type != "refresh" {
-        return Err(rocket::http::Status::Unauthorized);
+        return Err(ApiError::unauthorized(&format!(
+            "refresh_token: expected token_type 'refresh', got '{}'",
+            token_data.claims.token_type
+        )));
     }
 
-    // Verify if the refresh token exists in Redis
     let refresh_token_exists: bool = cache_connection
         .exists(&refresh_request.refresh_token)
-        .map_err(|_| rocket::http::Status::ServiceUnavailable)?;
+        .map_err(|e| {
+            ApiError::internal("refresh_token: checking refresh token existence in Redis", e)
+        })?;
 
     if !refresh_token_exists {
-        return Err(rocket::http::Status::Unauthorized);
+        return Err(ApiError::unauthorized(
+            "refresh_token: refresh token not found in Redis (expired or revoked)",
+        ));
     }
 
-    // Generate a new access token
     let access_token = create_jwt(
         &token_data.claims.sub,
         &token_data.claims.user_id,
@@ -590,15 +759,15 @@ pub fn refresh_token(
         &token_data.claims.last_name,
         &token_data.claims.middle_name,
         &token_data.claims.client_id,
-    );
+    )?;
 
     Ok(Json(RefreshTokenResponse { access_token }))
 }
 
 #[openapi()]
 #[get("/validate")]
-pub fn validate_token(claims: Claims) -> Result<Json<ValidateTokenResponse>, rocket::http::Status> {
-    Ok(Json(ValidateTokenResponse {
+pub fn validate_token(claims: Claims) -> Json<ValidateTokenResponse> {
+    Json(ValidateTokenResponse {
         sub: claims.sub,
         exp: claims.exp,
         user_id: claims.user_id,
@@ -606,22 +775,23 @@ pub fn validate_token(claims: Claims) -> Result<Json<ValidateTokenResponse>, roc
         last_name: claims.last_name,
         middle_name: claims.middle_name,
         client_id: claims.client_id,
-    }))
+    })
 }
 
 #[openapi()]
 #[get("/validate-api-token")]
-pub fn validate_api_token(
-    claims: APIClaims,
-) -> Result<Json<ValidateAPITokenResponse>, rocket::http::Status> {
-    Ok(Json(ValidateAPITokenResponse {
+pub fn validate_api_token(claims: APIClaims) -> Json<ValidateAPITokenResponse> {
+    Json(ValidateAPITokenResponse {
         sub: claims.sub,
         exp: claims.exp,
         group_id: claims.group_id,
         scopes: claims.scopes,
-    }))
+    })
 }
 
+/// Builds a signed JWT. Returns `ApiError` instead of panicking so a bad
+/// JWT_SECRET or an unexpected token_type surfaces as a normal 500 response
+/// rather than taking down the worker thread.
 fn create_jwt(
     email: &str,
     uid: &str,
@@ -630,11 +800,16 @@ fn create_jwt(
     l_name: &Option<String>,
     m_name: &Option<String>,
     c_id: &Option<String>,
-) -> String {
+) -> Result<String, ApiError> {
     let expiration = match token_type {
         "access" => Utc::now() + Duration::minutes(15), // Short-lived access token
-        "refresh" => Utc::now() + Duration::hours(10),   // Longer-lived refresh token
-        _ => panic!("Invalid token type"),
+        "refresh" => Utc::now() + Duration::hours(10),  // Longer-lived refresh token
+        other => {
+            return Err(ApiError::internal(
+                "create_jwt: invalid token_type requested",
+                format!("expected 'access' or 'refresh', got '{}'", other),
+            ))
+        }
     };
     let claims = Claims {
         sub: email.to_owned(),
@@ -646,13 +821,14 @@ fn create_jwt(
         middle_name: m_name.clone(),
         client_id: c_id.clone(),
     };
-    let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let secret =
+        env::var("JWT_SECRET").map_err(|e| ApiError::internal("create_jwt: reading JWT_SECRET env var", e))?;
     encode(
         &Header::default(),
         &claims,
         &EncodingKey::from_secret(secret.as_ref()),
     )
-    .unwrap()
+    .map_err(|e| ApiError::internal(&format!("create_jwt: encoding '{}' token", token_type), e))
 }
 
 #[openapi()]
@@ -661,15 +837,19 @@ pub fn update_profile(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     claims: Claims,
     update_request: Json<UpdateProfileRequest>,
-) -> Result<Json<MessageResponse>, Status> {
-    let mut conn: diesel::r2d2::PooledConnection<ConnectionManager<PgConnection>> =
-        rdb.get().map_err(|_| Status::ServiceUnavailable)?;
+) -> Result<Json<MessageResponse>, ApiError> {
+    let mut conn = get_conn(rdb, "update_profile")?;
 
     use crate::models::schema::schema::user::dsl::*;
 
-    let user_id = claims.user_id.parse::<i64>().unwrap();
+    let user_id_val = claims.user_id.parse::<i64>().map_err(|e| {
+        ApiError::internal(
+            &format!("update_profile: parsing claims.user_id '{}' as i64", claims.user_id),
+            e,
+        )
+    })?;
 
-    let updated_rows = diesel::update(user.filter(id.eq(user_id)))
+    let updated_rows = diesel::update(user.filter(id.eq(user_id_val)))
         .set((
             first_name.eq(&update_request.first_name),
             middle_name.eq(&update_request.middle_name),
@@ -677,14 +857,22 @@ pub fn update_profile(
             mobile_number.eq(&update_request.mobile_number),
         ))
         .execute(&mut conn)
-        .map_err(|_| Status::InternalServerError)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("update_profile: updating profile for user id={}", user_id_val),
+                e,
+            )
+        })?;
 
     if updated_rows > 0 {
         Ok(Json(MessageResponse {
             message: "Profile updated successfully".to_string(),
         }))
     } else {
-        Err(Status::NotFound)
+        Err(ApiError::not_found(&format!(
+            "update_profile: no user found with id={}",
+            user_id_val
+        )))
     }
 }
 
@@ -693,79 +881,75 @@ pub fn update_profile(
 pub fn get_app_by_client_id(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     client_id_: String,
-) -> Result<Json<AppResponse>, rocket::http::Status> {
+) -> Result<Json<AppResponse>, ApiError> {
     use crate::models::schema::schema::app::dsl::*;
 
-    let mut conn = rdb
-        .get()
-        .map_err(|_| rocket::http::Status::InternalServerError)?;
+    let mut conn = get_conn(rdb, "get_app_by_client_id")?;
 
-    match app
+    let a = app
         .filter(client_id.eq(&client_id_))
         .filter(disabled.eq(false))
         .first::<App>(&mut conn)
-    {
-        Ok(a) => Ok(Json(AppResponse {
-            name: a.name,
-            logo_url: a.logo_url,
-            app_url_dev: a.app_url_dev,
-            app_url_stage: a.app_url_stage,
-            app_url_prod: a.app_url_prod,
-            tnc_link: a.tnc_link,
-            allow_registration: a.allow_registration,
-            redirection_path: a.auth_redirection_path,
-        })),
-        Err(_) => Err(rocket::http::Status::NotFound),
-    }
+        .map_err(|e| {
+            ApiError::from_err(
+                Status::NotFound,
+                &format!(
+                    "get_app_by_client_id: app with client_id '{}' not found or disabled",
+                    client_id_
+                ),
+                e,
+            )
+        })?;
+
+    Ok(Json(AppResponse {
+        name: a.name,
+        logo_url: a.logo_url,
+        app_url_dev: a.app_url_dev,
+        app_url_stage: a.app_url_stage,
+        app_url_prod: a.app_url_prod,
+        tnc_link: a.tnc_link,
+        allow_registration: a.allow_registration,
+        redirection_path: a.auth_redirection_path,
+    }))
 }
 
 #[openapi]
 #[get("/group-memberships")]
-pub fn get_group_memberships(
-    rdb: &State<Pool<ConnectionManager<PgConnection>>>,
-    claims: Claims,
-    groups: GroupMemberships,
-) -> Result<Json<Vec<String>>, rocket::http::Status> {
-    Ok(Json(groups.0))
+pub fn get_group_memberships(claims: Claims, groups: GroupMemberships) -> Json<Vec<String>> {
+    Json(groups.0)
 }
 
 #[openapi]
 #[get("/group-ownerships")]
-pub fn get_group_ownserships(
-    rdb: &State<Pool<ConnectionManager<PgConnection>>>,
-    claims: Claims,
-    groups_owned: GroupOwnerships,
-) -> Result<Json<Vec<String>>, rocket::http::Status> {
-    Ok(Json(groups_owned.0))
+pub fn get_group_ownserships(claims: Claims, groups_owned: GroupOwnerships) -> Json<Vec<String>> {
+    Json(groups_owned.0)
 }
 
 #[openapi]
 #[get("/clear-redis")]
 pub fn clear_redis(
-    rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     claims: Claims,
     cache_pool: &State<Pool<RedisConnectionManager>>,
-) -> Result<Json<String>, rocket::http::Status> {
-    // Attempt to get a connection from the Redis pool
-    let mut cache_connection = cache_pool
-        .get()
-        .map_err(|_| rocket::http::Status::ServiceUnavailable)?;
+) -> Result<Json<String>, ApiError> {
+    let mut cache_connection = get_cache_conn(cache_pool, "clear_redis")?;
 
-    // Create cache keys using the user's ID from claims
     let cache_key = format!("user_groups:{}", claims.user_id);
     let cache_key_2 = format!("groups_owned:{}", claims.user_id);
 
-    // Attempt to delete the first cache key
-    cache_connection
-        .del::<_, i32>(&cache_key)
-        .map_err(|_| rocket::http::Status::InternalServerError)?;
+    cache_connection.del::<_, i32>(&cache_key).map_err(|e| {
+        ApiError::internal(
+            &format!("clear_redis: deleting key '{}'", cache_key),
+            e,
+        )
+    })?;
 
-    // Attempt to delete the second cache key
-    cache_connection
-        .del::<_, i32>(&cache_key_2)
-        .map_err(|_| rocket::http::Status::InternalServerError)?;
+    cache_connection.del::<_, i32>(&cache_key_2).map_err(|e| {
+        ApiError::internal(
+            &format!("clear_redis: deleting key '{}'", cache_key_2),
+            e,
+        )
+    })?;
 
-    // Return success message
     Ok(Json("Successfully cleared Redis cache.".to_string()))
 }
 
@@ -776,48 +960,32 @@ pub fn create_group(
     claims: Claims,
     create_request: Json<CreateGroupRequest>,
     cache_pool: &State<Pool<RedisConnectionManager>>,
-) -> Result<Json<Group>, status::Custom<String>> {
+) -> Result<Json<Group>, ApiError> {
     use crate::models::schema::schema::group::dsl::*;
     use crate::models::schema::schema::group_owners::dsl::*;
     use crate::models::schema::schema::group_users::dsl::*;
 
-    // Attempt to get a database connection
-    let mut conn = rdb.get().map_err(|_| {
-        status::Custom(
-            rocket::http::Status::ServiceUnavailable,
-            "Database connection is unavailable.".to_string(),
-        )
-    })?;
+    let mut conn = get_conn(rdb, "create_group")?;
+    let mut cache_connection = get_cache_conn(cache_pool, "create_group")?;
 
-    // Attempt to get a cache connection
-    let mut cache_connection = cache_pool.get().map_err(|_| {
-        status::Custom(
-            rocket::http::Status::ServiceUnavailable,
-            "Cache connection is unavailable.".to_string(),
-        )
-    })?;
-
-    // Check if the group already exists
     let group_exists = group
         .filter(identifier.eq(&create_request.id))
         .first::<Group>(&mut conn)
         .optional()
-        .map_err(|_| {
-            status::Custom(
-                rocket::http::Status::InternalServerError,
-                "Error checking if the group already exists.".to_string(),
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("create_group: checking if group '{}' already exists", create_request.id),
+                e,
             )
         })?;
 
-    // If the group already exists, return a conflict status
     if group_exists.is_some() {
-        return Err(status::Custom(
-            rocket::http::Status::Conflict,
-            "A group with this identifier already exists.".to_string(),
-        ));
+        return Err(ApiError::conflict(&format!(
+            "create_group: a group with identifier '{}' already exists",
+            create_request.id
+        )));
     }
 
-    // Attempt to insert the new group
     let new_group = GroupInsertable {
         identifier: create_request.id.clone(),
         disabled: false,
@@ -827,56 +995,64 @@ pub fn create_group(
     let created_group = diesel::insert_into(group)
         .values(&new_group)
         .get_result::<Group>(&mut conn)
-        .map_err(|_| {
-            status::Custom(
-                rocket::http::Status::InternalServerError,
-                "Error creating the new group.".to_string(),
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("create_group: inserting new group '{}'", create_request.id),
+                e,
             )
         })?;
 
-    // Attempt to insert into group_users
+    let user_id_val = claims.user_id.parse::<i64>().map_err(|e| {
+        ApiError::internal(
+            &format!("create_group: parsing claims.user_id '{}' as i64", claims.user_id),
+            e,
+        )
+    })?;
+
     let new_group_user = Group_UsersInsertable {
-        user_id: claims.user_id.parse::<i64>().unwrap(),
+        user_id: user_id_val,
         group_id: created_group.id,
     };
 
     diesel::insert_into(group_users)
         .values(&new_group_user)
         .execute(&mut conn)
-        .map_err(|_| {
-            status::Custom(
-                rocket::http::Status::InternalServerError,
-                "Error adding the user to the group.".to_string(),
+        .map_err(|e| {
+            ApiError::internal(
+                &format!(
+                    "create_group: adding user {} to group id={}",
+                    user_id_val, created_group.id
+                ),
+                e,
             )
         })?;
 
-    // Attempt to insert into group_owners
     let new_group_owner = Group_OwnersInsertable {
-        user_id: claims.user_id.parse::<i64>().unwrap(),
+        user_id: user_id_val,
         group_id: created_group.id,
     };
 
     diesel::insert_into(group_owners)
         .values(&new_group_owner)
         .execute(&mut conn)
-        .map_err(|_| {
-            status::Custom(
-                rocket::http::Status::InternalServerError,
-                "Error adding the user as a group owner.".to_string(),
+        .map_err(|e| {
+            ApiError::internal(
+                &format!(
+                    "create_group: adding user {} as owner of group id={}",
+                    user_id_val, created_group.id
+                ),
+                e,
             )
         })?;
 
-    // Attempt to delete the user's cached groups
     let cache_key = format!("user_groups:{}", claims.user_id);
-
-    let _ = cache_connection.del::<_, i32>(&cache_key).map_err(|_| {
-        status::Custom(
-            rocket::http::Status::InternalServerError,
-            "Error clearing the user's cached group list.".to_string(),
+    cache_connection.del::<_, i32>(&cache_key).map_err(|e| {
+        ApiError::internal(
+            &format!("create_group: clearing cached group list for user {}", claims.user_id),
+            e,
         )
     })?;
 
-    // If everything is successful, return the created group
     Ok(Json(created_group))
 }
 
@@ -886,38 +1062,45 @@ pub async fn request_password_reset(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     cache: &State<Pool<RedisConnectionManager>>,
     request: Json<RequestPasswordRequest>,
-) -> Result<Json<MessageResponse>, rocket::http::Status> {
+) -> Result<Json<MessageResponse>, ApiError> {
     use crate::models::schema::schema::user::dsl::*;
 
-    let mut cache_connection = cache
-        .get()
-        .map_err(|_| rocket::http::Status::ServiceUnavailable)?;
+    let mut cache_connection = get_cache_conn(cache, "request_password_reset")?;
+    let mut conn = get_conn(rdb, "request_password_reset")?;
 
-    let mut conn = rdb
-        .get()
-        .map_err(|_| rocket::http::Status::ServiceUnavailable)?;
-
-    // Find the user by email
     let u = user
         .filter(email_id.eq(&request.email_id))
         .first::<User>(&mut conn)
-        .map_err(|_| rocket::http::Status::NotFound)?;
+        .map_err(|e| {
+            ApiError::from_err(
+                Status::NotFound,
+                &format!(
+                    "request_password_reset: user with email '{}' not found",
+                    request.email_id
+                ),
+                e,
+            )
+        })?;
 
-    // Generate a random hash value
     let token_value: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(30)
         .map(char::from)
         .collect();
-    println!("{:?}", token_value);
-    // Insert the token into the database
+
     let _: () = cache_connection
         .set_ex(&token_value, u.id, 300) // Token expires in 5 minutes
-        .map_err(|_| rocket::http::Status::InternalServerError)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("request_password_reset: caching reset token for user {}", u.id),
+                e,
+            )
+        })?;
 
     let mut configuration = get_notification_service_configuration();
 
-    let token_str = env::var("ISC_SECRET").expect("ISC_SECRET must be set");
+    let token_str = env::var("ISC_SECRET")
+        .map_err(|e| ApiError::internal("request_password_reset: reading ISC_SECRET env var", e))?;
 
     configuration.api_key = Some(NotificationApiKey {
         key: token_str,
@@ -940,7 +1123,11 @@ pub async fn request_password_reset(
         Ok(_) => Ok(Json(MessageResponse {
             message: "Password reset token created successfully".to_string(),
         })),
-        Err(_) => Err(Status::ServiceUnavailable),
+        Err(e) => Err(ApiError::from_err(
+            Status::ServiceUnavailable,
+            &format!("request_password_reset: sending reset email to '{}'", request.email_id),
+            e,
+        )),
     }
 }
 
@@ -950,43 +1137,49 @@ pub fn reset_password(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     cache: &State<Pool<RedisConnectionManager>>,
     request: Json<ResetPasswordRequest>,
-) -> Result<Json<MessageResponse>, rocket::http::Status> {
+) -> Result<Json<MessageResponse>, ApiError> {
     use crate::models::schema::schema::user::dsl::*;
 
-    let mut cache_connection = cache
-        .get()
-        .map_err(|_| rocket::http::Status::ServiceUnavailable)?;
+    let mut cache_connection = get_cache_conn(cache, "reset_password")?;
+    let mut conn = get_conn(rdb, "reset_password")?;
 
-    let mut conn = rdb
-        .get()
-        .map_err(|_| rocket::http::Status::ServiceUnavailable)?;
+    let user_id: i64 = cache_connection.get(&request.token).map_err(|e| {
+        ApiError::from_err(
+            Status::NotFound,
+            "reset_password: reset token not found or expired",
+            e,
+        )
+    })?;
 
-    // Get user ID from cache using the token
-    let user_id: i64 = cache_connection
-        .get(&request.token)
-        .map_err(|_| rocket::http::Status::NotFound)?;
-
-    // Hash the new password
     let new_hashed_password = hash(&request.new_password, DEFAULT_COST)
-        .map_err(|_| rocket::http::Status::InternalServerError)?;
+        .map_err(|e| ApiError::internal("reset_password: hashing new password", e))?;
 
-    // Update the user's password in the database
     let updated_rows = update(user.filter(id.eq(user_id)))
         .set(password_hash.eq(Some(new_hashed_password)))
         .execute(&mut conn)
-        .map_err(|_| rocket::http::Status::InternalServerError)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("reset_password: updating password for user id={}", user_id),
+                e,
+            )
+        })?;
 
     if updated_rows > 0 {
-        // Delete the token from cache
-        let _: () = cache_connection
-            .del(&request.token)
-            .map_err(|_| rocket::http::Status::InternalServerError)?;
+        if let Err(e) = cache_connection.del::<_, ()>(&request.token) {
+            eprintln!(
+                "[WARN] reset_password: failed to delete used reset token -> {:?}",
+                e
+            );
+        }
 
         Ok(Json(MessageResponse {
             message: "Password updated successfully".to_string(),
         }))
     } else {
-        Err(rocket::http::Status::InternalServerError)
+        Err(ApiError::internal(
+            &format!("reset_password: update touched 0 rows for user id={}", user_id),
+            "expected 1 row to be updated",
+        ))
     }
 }
 
@@ -996,13 +1189,12 @@ pub fn create_api_token(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     create_request: Json<CreateApiTokenRequest>,
     claims: Claims,
-) -> status::Custom<Json<CreateApiTokenResponse>> {
+) -> Result<Json<CreateApiTokenResponse>, ApiError> {
     use crate::models::schema::schema::api_token::dsl::*;
     use crate::models::schema::schema::group::dsl as group_dsl;
 
-    let mut conn = rdb.get().expect("Failed to get DB connection");
+    let mut conn = get_conn(rdb, "create_api_token")?;
 
-    // Extract information from claims
     let user_id = claims.user_id;
     let first_name = claims.first_name;
     let last_name = claims.last_name;
@@ -1010,7 +1202,6 @@ pub fn create_api_token(
     let client_id = claims.client_id;
     let email = claims.sub;
 
-    // Generate a JWT token
     let expiration = Utc::now() + Duration::days(create_request.days_to_expire);
     let new_claims = Claims {
         sub: email,
@@ -1023,28 +1214,35 @@ pub fn create_api_token(
         client_id,
     };
 
-    let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let secret = env::var("JWT_SECRET")
+        .map_err(|e| ApiError::internal("create_api_token: reading JWT_SECRET env var", e))?;
     let token = encode(
         &Header::default(),
         &new_claims,
         &EncodingKey::from_secret(secret.as_ref()),
     )
-    .expect("Failed to create token");
+    .map_err(|e| ApiError::internal("create_api_token: encoding token", e))?;
 
-    // Find the group by its identifier
     let group: Group = group_dsl::group
         .filter(group_dsl::identifier.eq(&create_request.group_identifier))
         .first::<Group>(&mut conn)
-        .map_err(|_| Status::NotFound)
-        .unwrap();
+        .map_err(|e| {
+            ApiError::from_err(
+                Status::NotFound,
+                &format!(
+                    "create_api_token: group '{}' not found",
+                    create_request.group_identifier
+                ),
+                e,
+            )
+        })?;
 
-    // Insert the new API token into the database
     let new_token = Api_TokenInsertable {
         parent_id: group.id,
         expiry_date: expiration.naive_utc().date(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
-        is_active: true, // Assuming token is active by default
+        is_active: true,
         name: create_request.name.clone(),
         token_str: Some(token.clone()),
     };
@@ -1052,30 +1250,29 @@ pub fn create_api_token(
     diesel::insert_into(api_token)
         .values(&new_token)
         .execute(&mut conn)
-        .expect("Failed to insert new API token");
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("create_api_token: inserting token for group id={}", group.id),
+                e,
+            )
+        })?;
 
-    // Return the generated token
-    status::Custom(
-        Status::Ok,
-        Json(CreateApiTokenResponse { api_token: token }),
-    )
+    Ok(Json(CreateApiTokenResponse { api_token: token }))
 }
+
 #[openapi()]
 #[post("/logout", data = "<logout_request>")]
 pub fn logout(
     cache: &State<Pool<RedisConnectionManager>>,
     logout_request: Json<LogoutRequest>,
     claims: Claims,
-) -> Result<Json<MessageResponse>, rocket::http::Status> {
-    let mut cache_connection = cache
-        .get()
-        .map_err(|_| rocket::http::Status::ServiceUnavailable)?;
+) -> Result<Json<MessageResponse>, ApiError> {
+    let mut cache_connection = get_cache_conn(cache, "logout")?;
 
-    // Verify if the refresh token exists in Redis
     let refresh_token_key = logout_request.refresh_token.clone();
-    let refresh_token_exists: bool = cache_connection
-        .exists(&refresh_token_key)
-        .map_err(|_| rocket::http::Status::InternalServerError)?;
+    let refresh_token_exists: bool = cache_connection.exists(&refresh_token_key).map_err(|e| {
+        ApiError::internal("logout: checking refresh token existence in Redis", e)
+    })?;
 
     if !refresh_token_exists {
         return Ok(Json(MessageResponse {
@@ -1083,10 +1280,9 @@ pub fn logout(
         }));
     }
 
-    // Remove the refresh token from Redis
-    let _: () = cache_connection
-        .del(&refresh_token_key)
-        .map_err(|_| rocket::http::Status::InternalServerError)?;
+    let _: () = cache_connection.del(&refresh_token_key).map_err(|e| {
+        ApiError::internal("logout: deleting refresh token from Redis", e)
+    })?;
 
     Ok(Json(MessageResponse {
         message: "Logged out successfully".to_string(),
@@ -1098,32 +1294,36 @@ pub fn logout(
 pub fn get_members(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     group_param: String,
-) -> Result<Json<Vec<UserInfoResponse>>, Status> {
+) -> Result<Json<Vec<UserInfoResponse>>, ApiError> {
     use crate::models::schema::schema::group::dsl as group_dsl;
     use crate::models::schema::schema::group_owners::dsl as group_owners_dsl;
     use crate::models::schema::schema::group_users::dsl as group_users_dsl;
     use crate::models::schema::schema::user::dsl as users_dsl;
 
-    let mut conn = rdb.get().map_err(|_| Status::ServiceUnavailable)?;
+    let mut conn = get_conn(rdb, "get_members")?;
 
-    // Determine if `group_param` is an ID or an identifier
     let group_query: Box<dyn BoxableExpression<group_dsl::group, Pg, SqlType = Bool>> =
         if let Ok(group_id) = group_param.parse::<i64>() {
             Box::new(group_dsl::id.eq(group_id))
         } else {
-            Box::new(group_dsl::identifier.eq(group_param))
+            Box::new(group_dsl::identifier.eq(group_param.clone()))
         };
 
-    // Fetch the group ID using the dynamic query
     let group_id = group_dsl::group
         .filter(group_query)
         .select(group_dsl::id)
         .first::<i64>(&mut conn)
         .optional()
-        .map_err(|_| Status::InternalServerError)?
-        .ok_or(Status::NotFound)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("get_members: looking up group '{}'", group_param),
+                e,
+            )
+        })?
+        .ok_or_else(|| {
+            ApiError::not_found(&format!("get_members: group '{}' not found", group_param))
+        })?;
 
-    // Fetch the users associated with the group
     let users = group_users_dsl::group_users
         .inner_join(users_dsl::user.on(users_dsl::id.eq(group_users_dsl::user_id)))
         .filter(group_users_dsl::group_id.eq(group_id))
@@ -1135,16 +1335,24 @@ pub fn get_members(
             users_dsl::id,
         ))
         .load::<(Option<String>, Option<String>, Option<String>, String, i64)>(&mut conn)
-        .map_err(|_| Status::InternalServerError)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("get_members: loading users for group id={}", group_id),
+                e,
+            )
+        })?;
 
-    // Fetch the group owners
     let group_owners: Vec<i64> = group_owners_dsl::group_owners
         .filter(group_owners_dsl::group_id.eq(group_id))
         .select(group_owners_dsl::user_id)
         .load(&mut conn)
-        .map_err(|_| Status::InternalServerError)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("get_members: loading owners for group id={}", group_id),
+                e,
+            )
+        })?;
 
-    // Map the user information into the UserInfo struct
     let user_info: Vec<UserInfoResponse> = users
         .into_iter()
         .map(
@@ -1165,26 +1373,39 @@ pub fn get_members(
 fn fetch_group_members_ids(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     group_identifier: &str,
-) -> Result<Vec<i64>, Status> {
+) -> Result<Vec<i64>, ApiError> {
     use crate::models::schema::schema::group::dsl as group_dsl;
     use crate::models::schema::schema::group_users::dsl as group_users_dsl;
-    let mut conn = rdb.get().map_err(|_| Status::ServiceUnavailable)?;
+    let mut conn = get_conn(rdb, "fetch_group_members_ids")?;
 
-    // Fetch the group ID based on the identifier
     let group_id = group_dsl::group
         .filter(group_dsl::identifier.eq(group_identifier))
         .select(group_dsl::id)
         .first::<i64>(&mut conn)
         .optional()
-        .map_err(|_| Status::InternalServerError)?
-        .ok_or(Status::NotFound)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("fetch_group_members_ids: looking up group '{}'", group_identifier),
+                e,
+            )
+        })?
+        .ok_or_else(|| {
+            ApiError::not_found(&format!(
+                "fetch_group_members_ids: group '{}' not found",
+                group_identifier
+            ))
+        })?;
 
-    // Fetch the user IDs associated with the group
     let user_ids = group_users_dsl::group_users
         .filter(group_users_dsl::group_id.eq(group_id))
         .select(group_users_dsl::user_id)
         .load::<i64>(&mut conn)
-        .map_err(|_| Status::InternalServerError)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("fetch_group_members_ids: loading user ids for group id={}", group_id),
+                e,
+            )
+        })?;
 
     Ok(user_ids)
 }
@@ -1195,9 +1416,8 @@ pub fn get_group_members_ids_api_land(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     group_identifier: String,
     _claims: APIClaims,
-) -> Result<Json<Vec<i64>>, Status> {
-    let user_ids = fetch_group_members_ids(rdb, &group_identifier)?;
-    Ok(Json(user_ids))
+) -> Result<Json<Vec<i64>>, ApiError> {
+    Ok(Json(fetch_group_members_ids(rdb, &group_identifier)?))
 }
 
 #[openapi()]
@@ -1206,9 +1426,8 @@ pub fn get_group_members_ids_user_land(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     group_identifier: String,
     _claims: Claims,
-) -> Result<Json<Vec<i64>>, Status> {
-    let user_ids = fetch_group_members_ids(rdb, &group_identifier)?;
-    Ok(Json(user_ids))
+) -> Result<Json<Vec<i64>>, ApiError> {
+    Ok(Json(fetch_group_members_ids(rdb, &group_identifier)?))
 }
 
 #[openapi()]
@@ -1217,9 +1436,8 @@ pub fn get_group_members_ids(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     group_identifier: String,
     _claims: ISCClaims,
-) -> Result<Json<Vec<i64>>, Status> {
-    let user_ids = fetch_group_members_ids(rdb, &group_identifier)?;
-    Ok(Json(user_ids))
+) -> Result<Json<Vec<i64>>, ApiError> {
+    Ok(Json(fetch_group_members_ids(rdb, &group_identifier)?))
 }
 
 #[openapi()]
@@ -1229,8 +1447,8 @@ pub fn manage_membership(
     group_param: String,
     user_id: String,
     action: String,
-) -> Result<Json<Value>, Status> {
-    let mut conn = rdb.get().map_err(|_| Status::ServiceUnavailable)?;
+) -> Result<Json<Value>, ApiError> {
+    let mut conn = get_conn(rdb, "manage_membership")?;
 
     use crate::models::schema::schema::group::dsl as group_dsl;
     use crate::models::schema::schema::group_owners::dsl as group_owners_dsl;
@@ -1241,67 +1459,114 @@ pub fn manage_membership(
         if let Ok(group_id) = group_param.parse::<i64>() {
             Box::new(group_dsl::id.eq(group_id))
         } else {
-            Box::new(group_dsl::identifier.eq(group_param))
+            Box::new(group_dsl::identifier.eq(group_param.clone()))
         };
-    // Find the group by its identifier
+
     let group: Group = group_dsl::group
         .filter(group_query)
         .first::<Group>(&mut conn)
-        .map_err(|_| Status::NotFound)?;
+        .map_err(|e| {
+            ApiError::from_err(
+                Status::NotFound,
+                &format!("manage_membership: group '{}' not found", group_param),
+                e,
+            )
+        })?;
 
     let user: User = user_dsl::user
         .filter(user_dsl::email_id.eq(&user_id))
         .first::<User>(&mut conn)
-        .map_err(|_| Status::NotFound)?;
+        .map_err(|e| {
+            ApiError::from_err(
+                Status::NotFound,
+                &format!("manage_membership: user '{}' not found", user_id),
+                e,
+            )
+        })?;
 
     match action.as_str() {
         "add-member" => {
-            // Remove the user from owners
             diesel::delete(
                 group_owners_dsl::group_owners
                     .filter(group_owners_dsl::user_id.eq(user.id))
                     .filter(group_owners_dsl::group_id.eq(group.id)),
             )
             .execute(&mut conn)
-            .map_err(|_| Status::InternalServerError)?;
+            .map_err(|e| {
+                ApiError::internal(
+                    &format!(
+                        "manage_membership: removing user {} from owners of group {}",
+                        user.id, group.id
+                    ),
+                    e,
+                )
+            })?;
 
-            // Add the user as a member
             diesel::insert_into(group_users_dsl::group_users)
                 .values((
                     group_users_dsl::user_id.eq(user.id),
                     group_users_dsl::group_id.eq(group.id),
                 ))
                 .execute(&mut conn)
-                .map_err(|_| Status::InternalServerError)?;
+                .map_err(|e| {
+                    ApiError::internal(
+                        &format!(
+                            "manage_membership: adding user {} as member of group {}",
+                            user.id, group.id
+                        ),
+                        e,
+                    )
+                })?;
         }
         "add-admin" => {
-            // Add the user as a member
             diesel::insert_into(group_users_dsl::group_users)
                 .values((
                     group_users_dsl::user_id.eq(user.id),
                     group_users_dsl::group_id.eq(group.id),
                 ))
                 .execute(&mut conn)
-                .map_err(|_| Status::InternalServerError)?;
+                .map_err(|e| {
+                    ApiError::internal(
+                        &format!(
+                            "manage_membership: adding user {} as member of group {}",
+                            user.id, group.id
+                        ),
+                        e,
+                    )
+                })?;
 
-            // Add the user as an owner
             diesel::insert_into(group_owners_dsl::group_owners)
                 .values((
                     group_owners_dsl::user_id.eq(user.id),
                     group_owners_dsl::group_id.eq(group.id),
                 ))
                 .execute(&mut conn)
-                .map_err(|_| Status::InternalServerError)?;
+                .map_err(|e| {
+                    ApiError::internal(
+                        &format!(
+                            "manage_membership: adding user {} as owner of group {}",
+                            user.id, group.id
+                        ),
+                        e,
+                    )
+                })?;
         }
         "remove" => {
-            // Remove the user from members and owners
             diesel::delete(
                 group_users_dsl::group_users
                     .filter(group_users_dsl::user_id.eq(user.id))
                     .filter(group_users_dsl::group_id.eq(group.id)),
             )
             .execute(&mut conn)
-            .map_err(|_| Status::InternalServerError)?;
+            .map_err(|e| {
+                ApiError::internal(
+                    &format!(
+                        "manage_membership: removing user {} from members of group {}",
+                        user.id, group.id
+                    ),
+                    e,
+                )
+            })?;
 
             diesel::delete(
                 group_owners_dsl::group_owners
@@ -1309,49 +1574,55 @@ pub fn manage_membership(
                     .filter(group_owners_dsl::group_id.eq(group.id)),
             )
             .execute(&mut conn)
-            .map_err(|_| Status::InternalServerError)?;
+            .map_err(|e| {
+                ApiError::internal(
+                    &format!(
+                        "manage_membership: removing user {} from owners of group {}",
+                        user.id, group.id
+                    ),
+                    e,
+                )
+            })?;
         }
-        _ => return Err(Status::BadRequest),
+        other => {
+            return Err(ApiError::bad_request(&format!(
+                "manage_membership: unknown action '{}' (expected add-member, add-admin, or remove)",
+                other
+            )))
+        }
     }
 
     Ok(Json(json!({ "status": "success" })))
 }
+
 #[openapi()]
 #[post("/create-api-session-token", data = "<request>")]
 pub fn create_api_session_token(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     request: Json<CreateSessionTokenRequest>,
-) -> status::Custom<Json<CreateSessionTokenResponse>> {
+) -> Result<Json<CreateSessionTokenResponse>, ApiError> {
     use crate::models::schema::schema::api_token::dsl as api_token_dsl;
     use crate::models::schema::schema::group::dsl as group_dsl;
 
-    let mut conn = rdb.get().expect("Failed to get DB connection");
+    let mut conn = get_conn(rdb, "create_api_session_token")?;
 
-    // Fetch the api_token and join with group to get the identifier
     let result: Option<(Api_Token, Group)> = api_token_dsl::api_token
         .inner_join(group_dsl::group.on(group_dsl::id.eq(api_token_dsl::parent_id)))
         .filter(api_token_dsl::token_str.eq(&request.api_token))
         .filter(api_token_dsl::is_active.eq(true))
-        .select((
-            Api_Token::as_select(),
-            Group::as_select(),
-        ))
+        .select((Api_Token::as_select(), Group::as_select()))
         .first::<(Api_Token, Group)>(&mut conn)
         .optional()
-        .unwrap_or(None);
+        .map_err(|e| {
+            ApiError::internal(
+                "create_api_session_token: looking up API token",
+                e,
+            )
+        })?;
 
-    let (api_token, group) = match result {
-        Some(pair) => pair,
-        None => {
-            return status::Custom(
-                Status::Unauthorized,
-                Json(CreateSessionTokenResponse {
-                    session_token: "".to_string(),
-                    group_identifier: "".to_string(),
-                }),
-            );
-        }
-    };
+    let (api_token, group) = result.ok_or_else(|| {
+        ApiError::unauthorized("create_api_session_token: API token not found or inactive")
+    })?;
 
     let expiration = match request.days_to_expire {
         Some(days) => Utc::now() + Duration::days(days as i64),
@@ -1364,21 +1635,20 @@ pub fn create_api_session_token(
         scopes: vec!["read".to_string(), "write".to_string()],
     };
 
-    let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let secret = env::var("JWT_SECRET").map_err(|e| {
+        ApiError::internal("create_api_session_token: reading JWT_SECRET env var", e)
+    })?;
     let token = encode(
         &Header::default(),
         &claims,
         &EncodingKey::from_secret(secret.as_ref()),
     )
-    .expect("Failed to create session token");
+    .map_err(|e| ApiError::internal("create_api_session_token: encoding session token", e))?;
 
-    status::Custom(
-        Status::Ok,
-        Json(CreateSessionTokenResponse {
-            session_token: token,
-            group_identifier: group.identifier,  // populated from the join
-        }),
-    )
+    Ok(Json(CreateSessionTokenResponse {
+        session_token: token,
+        group_identifier: group.identifier,
+    }))
 }
 
 /// this is used by the developers on their machine for creating a session. This assumes that there is an active session on the machine
@@ -1389,42 +1659,63 @@ pub fn create_api_session_token_interactive(
     claims: Claims,
     group_identifier: String,
     groups_ownerships: GroupOwnerships,
-) -> Result<Json<CreateSessionTokenResponse>, rocket::http::Status> {
+) -> Result<Json<CreateSessionTokenResponse>, ApiError> {
     use crate::models::schema::schema::group::dsl as group_dsl;
 
-    let mut conn = rdb.get().expect("Failed to get DB connection");
+    let mut conn = get_conn(rdb, "create_api_session_token_interactive")?;
 
     let group = group_dsl::group
         .filter(group_dsl::identifier.eq(group_identifier.clone()))
         .first::<Group>(&mut conn)
         .optional()
-        .map_err(|_| Status::InternalServerError)?;
-
-    let group = group.ok_or(Status::NotFound)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!(
+                    "create_api_session_token_interactive: looking up group '{}'",
+                    group_identifier
+                ),
+                e,
+            )
+        })?
+        .ok_or_else(|| {
+            ApiError::not_found(&format!(
+                "create_api_session_token_interactive: group '{}' not found",
+                group_identifier
+            ))
+        })?;
 
     // Determine the scope based on ownership
-    let scopes = if groups_ownerships.0.contains(&group_identifier.clone()) {
+    let scopes = if groups_ownerships.0.contains(&group_identifier) {
         vec!["read".to_string(), "write".to_string()]
     } else {
         vec!["read".to_string()]
     };
 
-    // Generate a JWT session token valid for 5 minutes
     let expiration = Utc::now() + Duration::hours(10);
     let claims = APIClaims {
         sub: group.identifier.clone(),
         exp: expiration.timestamp() as usize,
-        group_id: group.id, // Use parent_id from the Api_Token
+        group_id: group.id,
         scopes,
     };
 
-    let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let secret = env::var("JWT_SECRET").map_err(|e| {
+        ApiError::internal(
+            "create_api_session_token_interactive: reading JWT_SECRET env var",
+            e,
+        )
+    })?;
     let token = encode(
         &Header::default(),
         &claims,
         &EncodingKey::from_secret(secret.as_ref()),
     )
-    .expect("Failed to create session token");
+    .map_err(|e| {
+        ApiError::internal(
+            "create_api_session_token_interactive: encoding session token",
+            e,
+        )
+    })?;
 
     Ok(Json(CreateSessionTokenResponse {
         session_token: token,
@@ -1437,35 +1728,39 @@ pub fn create_api_session_token_interactive(
 pub fn get_api_tokens_by_group(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     group_identifier: String,
-) -> Result<Json<Vec<GroupApiTokenResponse>>, Status> {
+) -> Result<Json<Vec<GroupApiTokenResponse>>, ApiError> {
     use crate::models::schema::schema::api_token::dsl as api_token_dsl;
     use crate::models::schema::schema::group::dsl as group_dsl;
 
-    // Acquire a database connection from the pool
-    let mut conn = rdb.get().map_err(|_| Status::InternalServerError)?;
+    let mut conn = get_conn(rdb, "get_api_tokens_by_group")?;
 
-    // Step 1: Retrieve the group based on the provided group_identifier
     let group = group_dsl::group
         .filter(group_dsl::identifier.eq(&group_identifier))
         .first::<Group>(&mut conn)
         .optional()
-        .map_err(|_| Status::InternalServerError)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("get_api_tokens_by_group: looking up group '{}'", group_identifier),
+                e,
+            )
+        })?
+        .ok_or_else(|| {
+            ApiError::not_found(&format!(
+                "get_api_tokens_by_group: group '{}' not found",
+                group_identifier
+            ))
+        })?;
 
-    // If the group does not exist, return a 404 Not Found error
-    let group = match group {
-        Some(g) => g,
-        None => {
-            return Err(Status::NotFound);
-        }
-    };
-
-    // Step 2: Retrieve all API tokens associated with the group's primary key (group.id)
     let tokens = api_token_dsl::api_token
         .filter(api_token_dsl::parent_id.eq(group.id))
         .load::<Api_Token>(&mut conn)
-        .map_err(|_| Status::InternalServerError)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("get_api_tokens_by_group: loading tokens for group id={}", group.id),
+                e,
+            )
+        })?;
 
-    // Step 3: Map the retrieved tokens to the response struct
     let response: Vec<GroupApiTokenResponse> = tokens
         .into_iter()
         .map(|t| GroupApiTokenResponse {
@@ -1477,7 +1772,6 @@ pub fn get_api_tokens_by_group(
         })
         .collect();
 
-    // Step 4: Return the response with a 200 OK status
     Ok(Json(response))
 }
 
@@ -1486,34 +1780,39 @@ pub fn get_api_tokens_by_group(
 pub fn deactivate_api_token(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     token_id: i64,
-) -> Result<Json<MessageResponse>, rocket::http::Status> {
+) -> Result<Json<MessageResponse>, ApiError> {
     use crate::models::schema::schema::api_token::dsl::*;
 
-    // Acquire a database connection from the pool
-    let mut conn = rdb.get().map_err(|_| Status::InternalServerError)?;
+    let mut conn = get_conn(rdb, "deactivate_api_token")?;
 
-    // Step 1: Find the API token by its ID
     let token = api_token
         .find(token_id)
         .first::<Api_Token>(&mut conn)
         .optional()
-        .map_err(|_| Status::InternalServerError)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("deactivate_api_token: looking up token id={}", token_id),
+                e,
+            )
+        })?;
 
-    // If the token does not exist, return a 404 Not Found error
-    match token {
-        Some(t) => t,
-        None => {
-            return Err(Status::NotFound);
-        }
-    };
+    if token.is_none() {
+        return Err(ApiError::not_found(&format!(
+            "deactivate_api_token: token id={} not found",
+            token_id
+        )));
+    }
 
-    // Step 2: Deactivate the token (setting `is_active` to false)
     diesel::update(api_token.filter(id.eq(token_id)))
         .set(is_active.eq(false))
         .execute(&mut conn)
-        .map_err(|_| Status::InternalServerError)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("deactivate_api_token: deactivating token id={}", token_id),
+                e,
+            )
+        })?;
 
-    // Step 3: Return a success message
     Ok(Json(MessageResponse {
         message: format!("API token with id '{}' has been deactivated", token_id),
     }))
@@ -1526,38 +1825,39 @@ pub fn accept_invite(
     cache: &State<Pool<RedisConnectionManager>>,
     invitation_token: String,
     accept_request: Json<AcceptInviteRequest>,
-) -> Result<Json<String>, Status> {
+) -> Result<Json<String>, ApiError> {
     use crate::models::schema::schema::user::dsl::*;
 
-    let mut conn = rdb.get().expect("Failed to get DB connection");
+    let mut conn = get_conn(rdb, "accept_invite")?;
+    let mut cache_connection = get_cache_conn(cache, "accept_invite")?;
 
-    let mut cache_connection = cache
-        .get()
-        .map_err(|_| rocket::http::Status::ServiceUnavailable)?;
+    let invite_data: String = cache_connection.get(&invitation_token).map_err(|e| {
+        ApiError::from_err(
+            Status::NotFound,
+            "accept_invite: invitation token not found or expired",
+            e,
+        )
+    })?;
 
-    // Get invitation data from cache using the token
-    let invite_data: String = cache_connection
-        .get(&invitation_token)
-        .map_err(|_| rocket::http::Status::NotFound)?;
+    if let Err(e) = cache_connection.del::<_, ()>(&invitation_token) {
+        eprintln!(
+            "[WARN] accept_invite: failed to delete used invitation token -> {:?}",
+            e
+        );
+    }
 
-    // Remove the token from cache after reading
-    cache_connection
-        .del::<_, ()>(&invitation_token)
-        .map_err(|_| Status::InternalServerError)?;
+    let invite_request: InviteRequest = serde_json::from_str(&invite_data).map_err(|e| {
+        ApiError::internal("accept_invite: deserializing cached invitation payload", e)
+    })?;
 
-    // Deserialize the invitation data
-    let invite_request: InviteRequest = serde_json::from_str(&invite_data).unwrap();
-
-    // Hash the provided password
     let hashed_password = bcrypt::hash(&accept_request.password, bcrypt::DEFAULT_COST)
-        .map_err(|_| Status::InternalServerError)?;
+        .map_err(|e| ApiError::internal("accept_invite: hashing password", e))?;
 
-    // Create a new user in the database
     let new_user = UserInsertable {
         first_name: Some(invite_request.first_name),
         last_name: Some(invite_request.last_name),
         middle_name: invite_request.middle_name,
-        email_id: invite_request.email,
+        email_id: invite_request.email.clone(),
         mobile_number: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -1569,7 +1869,12 @@ pub fn accept_invite(
     insert_into(user)
         .values(&new_user)
         .execute(&mut conn)
-        .map_err(|_| Status::InternalServerError)?;
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("accept_invite: inserting new user '{}'", invite_request.email),
+                e,
+            )
+        })?;
 
     Ok(Json(
         "Invitation accepted, user registered successfully".to_string(),
@@ -1582,15 +1887,12 @@ pub fn get_accessible_apps(
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     claims: Claims,
     groups: GroupMemberships,
-) -> Result<Json<Vec<AccessibleApp>>, rocket::http::Status> {
+) -> Result<Json<Vec<AccessibleApp>>, ApiError> {
     use crate::models::schema::schema::app::dsl as app_dsl;
     use crate::models::schema::schema::group::dsl as group_dsl;
 
-    let mut conn = rdb
-        .get()
-        .map_err(|_| rocket::http::Status::ServiceUnavailable)?;
+    let mut conn = get_conn(rdb, "get_accessible_apps")?;
 
-    // Fetch all apps and join with groups for access evaluation
     let apps_with_groups = app_dsl::app
         .left_join(group_dsl::group.on(group_dsl::id.nullable().eq(app_dsl::group_id)))
         .select((
@@ -1619,12 +1921,10 @@ pub fn get_accessible_apps(
             bool,
             Option<String>,
         )>(&mut conn)
-        .map_err(|_| rocket::http::Status::InternalServerError)?;
+        .map_err(|e| ApiError::internal("get_accessible_apps: loading apps with group info", e))?;
 
-    // Group memberships from the user's claims
     let user_groups: Vec<String> = groups.0;
 
-    // Filter apps the user has access to
     let accessible_apps: Vec<AccessibleApp> = apps_with_groups
         .into_iter()
         .filter_map(
@@ -1641,7 +1941,6 @@ pub fn get_accessible_apps(
                 has_web_interface,
                 group_identifier,
             )| {
-                // Public apps (no group restriction)
                 if group_identifier.is_none() || user_groups.contains(&group_identifier.unwrap()) {
                     Some(AccessibleApp {
                         name: app_name,
@@ -1652,8 +1951,8 @@ pub fn get_accessible_apps(
                         app_url_dev: app_dev_url,
                         app_url_stage: app_stage_url,
                         app_url_prod: app_prod_url,
-                        redirection_path: redirection_path,
-                        has_web_interface: has_web_interface,
+                        redirection_path,
+                        has_web_interface,
                     })
                 } else {
                     None
@@ -1664,6 +1963,7 @@ pub fn get_accessible_apps(
 
     Ok(Json(accessible_apps))
 }
+
 #[openapi()]
 #[post("/generate-app-tokens/<app_id>")]
 pub fn generate_app_tokens(
@@ -1671,24 +1971,25 @@ pub fn generate_app_tokens(
     cache_pool: &State<Pool<RedisConnectionManager>>,
     app_id: String,
     claims: Claims,
-    groups: GroupMemberships, // Injected user groups
-) -> Result<Json<LoginResponse>, rocket::http::Status> {
-    let mut conn = rdb
-        .get()
-        .map_err(|_| rocket::http::Status::ServiceUnavailable)?;
+    groups: GroupMemberships,
+) -> Result<Json<LoginResponse>, ApiError> {
+    let mut conn = get_conn(rdb, "generate_app_tokens")?;
+    let mut cache_connection = get_cache_conn(cache_pool, "generate_app_tokens")?;
 
-    let mut cache_connection = cache_pool
-        .get()
-        .map_err(|_| rocket::http::Status::ServiceUnavailable)?;
+    let has_access = user_has_access_to_app(&mut conn, &app_id, &groups.0).map_err(|e| {
+        ApiError::internal(
+            &format!("generate_app_tokens: checking access to app '{}'", app_id),
+            e,
+        )
+    })?;
 
-    // Validate if the app exists and the user has access
-    if !user_has_access_to_app(&mut conn, &app_id, &groups.0)
-        .map_err(|_| rocket::http::Status::InternalServerError)?
-    {
-        return Err(rocket::http::Status::Forbidden);
+    if !has_access {
+        return Err(ApiError::forbidden(&format!(
+            "generate_app_tokens: user '{}' does not have access to app '{}'",
+            claims.sub, app_id
+        )));
     }
 
-    // Generate new tokens
     let access_token = create_jwt(
         &claims.sub,
         &claims.user_id,
@@ -1697,7 +1998,7 @@ pub fn generate_app_tokens(
         &claims.last_name,
         &claims.middle_name,
         &Some(app_id.clone()),
-    );
+    )?;
     let refresh_token = create_jwt(
         &claims.sub,
         &claims.user_id,
@@ -1706,22 +2007,21 @@ pub fn generate_app_tokens(
         &claims.last_name,
         &claims.middle_name,
         &Some(app_id.clone()),
-    );
+    )?;
 
-    // Store the new refresh token in Redis
     let session_data = json!({
         "user_id": claims.user_id,
         "app_id": app_id,
     });
     let _: () = cache_connection
-        .set_ex(
-            refresh_token.clone(),
-            session_data.to_string(),
-            3600, // Token expires in 1 hour
-        )
-        .map_err(|_| rocket::http::Status::InternalServerError)?;
+        .set_ex(refresh_token.clone(), session_data.to_string(), 3600)
+        .map_err(|e| {
+            ApiError::internal(
+                &format!("generate_app_tokens: caching session for app '{}'", app_id),
+                e,
+            )
+        })?;
 
-    // Return the new tokens
     Ok(Json(LoginResponse {
         access_token,
         refresh_token,
@@ -1733,35 +2033,27 @@ pub fn generate_app_tokens(
 pub async fn create_or_update_app(
     app_request: Json<CreateOrUpdateAppRequest>,
     rdb: &State<Pool<ConnectionManager<PgConnection>>>,
-    _claims: APIClaims, // Assuming claims are passed for authentication/authorization
-) -> Result<status::Created<Json<MessageResponse>>, status::Custom<Json<MessageResponse>>> {
+    _claims: APIClaims,
+) -> Result<status::Created<Json<MessageResponse>>, ApiError> {
     use crate::models::schema::schema::app::dsl as app_dsl;
 
-    let mut conn = rdb.get().map_err(|_| {
-        status::Custom(
-            Status::ServiceUnavailable,
-            Json(MessageResponse {
-                message: "Failed to get DB connection".to_string(),
-            }),
-        )
-    })?;
+    let mut conn = get_conn(rdb, "create_or_update_app")?;
 
-    // Check if the app exists
     let existing_app = app_dsl::app
         .filter(app_dsl::client_id.eq(&app_request.client_id))
         .first::<App>(&mut conn)
         .optional()
-        .map_err(|_| {
-            status::Custom(
-                Status::InternalServerError,
-                Json(MessageResponse {
-                    message: "Error retrieving app".to_string(),
-                }),
+        .map_err(|e| {
+            ApiError::internal(
+                &format!(
+                    "create_or_update_app: looking up app with client_id '{}'",
+                    app_request.client_id
+                ),
+                e,
             )
         })?;
 
     if let Some(app) = existing_app {
-        // Update the existing app
         diesel::update(app_dsl::app.filter(app_dsl::id.eq(app.id)))
             .set((
                 app_request.name.as_ref().map(|name| app_dsl::name.eq(name)),
@@ -1807,12 +2099,10 @@ pub async fn create_or_update_app(
                     .map(|web| app_dsl::web_interface.eq(web)),
             ))
             .execute(&mut conn)
-            .map_err(|_| {
-                status::Custom(
-                    Status::InternalServerError,
-                    Json(MessageResponse {
-                        message: "Error updating app".to_string(),
-                    }),
+            .map_err(|e| {
+                ApiError::internal(
+                    &format!("create_or_update_app: updating app id={}", app.id),
+                    e,
                 )
             })?;
 
@@ -1820,7 +2110,6 @@ pub async fn create_or_update_app(
             message: "App updated successfully".to_string(),
         })))
     } else {
-        // Create a new app
         let new_app = AppInsertable {
             client_id: app_request.client_id.clone(),
             name: app_request.name.clone().unwrap_or_default(),
@@ -1840,12 +2129,13 @@ pub async fn create_or_update_app(
         diesel::insert_into(app_dsl::app)
             .values(&new_app)
             .execute(&mut conn)
-            .map_err(|_| {
-                status::Custom(
-                    Status::InternalServerError,
-                    Json(MessageResponse {
-                        message: "Error creating app".to_string(),
-                    }),
+            .map_err(|e| {
+                ApiError::internal(
+                    &format!(
+                        "create_or_update_app: creating app with client_id '{}'",
+                        app_request.client_id
+                    ),
+                    e,
                 )
             })?;
 
@@ -1859,31 +2149,25 @@ pub async fn create_or_update_app(
 #[get("/is_member/<group_param>")]
 pub fn is_member(
     group_param: String,
-    groups: GroupMemberships,      // Injected group memberships
-    groups_owned: GroupOwnerships, // Injected group ownerships
-) -> Result<Json<IsMemberResponse>, rocket::http::Status> {
-    // Check if the user is a member of the group
+    groups: GroupMemberships,
+    groups_owned: GroupOwnerships,
+) -> Json<IsMemberResponse> {
     let is_member = groups.0.contains(&group_param);
-
-    // Check if the user is an owner of the group
     let is_owner = groups_owned.0.contains(&group_param);
 
-    Ok(Json(IsMemberResponse {
+    Json(IsMemberResponse {
         is_member,
         is_owner,
-    }))
+    })
 }
 
+// ── Libtrust kid computation ─────────────────────────────────────────────────
 
-
-// ── Libtrust kid computation ───────────────────────────────────────────────────
-
-fn compute_libtrust_kid(signing_key: &SigningKey) -> String {
-    // Get DER-encoded SubjectPublicKeyInfo
+fn compute_libtrust_kid(signing_key: &SigningKey) -> Result<String, ApiError> {
     let pub_der = signing_key
         .verifying_key()
         .to_public_key_der()
-        .expect("Failed to encode public key to DER");
+        .map_err(|e| ApiError::internal("compute_libtrust_kid: encoding public key to DER", e))?;
 
     // SHA256 of the DER bytes, take first 30 bytes (240 bits)
     let digest = Sha256::digest(pub_der.as_bytes());
@@ -1891,61 +2175,43 @@ fn compute_libtrust_kid(signing_key: &SigningKey) -> String {
 
     // Base32-encode (no padding) → 48 chars → split into 12 groups of 4
     let b32 = base32::encode(Alphabet::RFC4648 { padding: false }, truncated);
-    b32.chars()
+    Ok(b32
+        .chars()
         .collect::<Vec<char>>()
         .chunks(4)
         .map(|c| c.iter().collect::<String>())
         .collect::<Vec<String>>()
-        .join(":")
+        .join(":"))
 }
 
-// ── Core token generation function ────────────────────────────────────────────
+// ── Core token generation function ───────────────────────────────────────────
 fn generate_docker_token(
     service: &str,
     scope: Option<&str>,
     account: &str,
-) -> Result<DockerTokenResponse, rocket::http::Status> {
-    let pem = match env::var("DOCKER_REGISTRY_PRIVATE_KEY") {
-        Ok(val) => val,
-        Err(e) => {
-            println!("[docker-token] ❌ DOCKER_REGISTRY_PRIVATE_KEY not set: {}", e);
-            return Err(rocket::http::Status::InternalServerError);
-        }
-    };
+) -> Result<DockerTokenResponse, ApiError> {
+    let pem = env::var("DOCKER_REGISTRY_PRIVATE_KEY").map_err(|e| {
+        ApiError::internal("generate_docker_token: reading DOCKER_REGISTRY_PRIVATE_KEY env var", e)
+    })?;
 
     let signing_key = if pem.contains("BEGIN EC PRIVATE KEY") {
         SigningKey::from_sec1_pem(&pem)
-            .map_err(|e| {
-                println!("[docker-token] ❌ from_sec1_pem failed: {:?}", e);
-                rocket::http::Status::InternalServerError
-            })
+            .map_err(|e| ApiError::internal("generate_docker_token: parsing SEC1 PEM private key", e))
     } else {
         SigningKey::from_pkcs8_pem(&pem)
-            .map_err(|e| {
-                println!("[docker-token] ❌ from_pkcs8_pem failed: {:?}", e);
-                rocket::http::Status::InternalServerError
-            })
+            .map_err(|e| ApiError::internal("generate_docker_token: parsing PKCS8 PEM private key", e))
     }?;
 
-    let kid = compute_libtrust_kid(&signing_key);
-    println!("[docker-token] ✅ kid={}", kid);
+    let kid = compute_libtrust_kid(&signing_key)?;
 
     // Convert to PKCS#8 PEM in memory so jsonwebtoken can consume it
     // regardless of what format the original key was in
     let pkcs8_pem = signing_key
         .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
-        .map_err(|e| {
-            println!("[docker-token] ❌ to_pkcs8_pem failed: {:?}", e);
-            rocket::http::Status::InternalServerError
-        })?;
+        .map_err(|e| ApiError::internal("generate_docker_token: re-encoding key as PKCS8 PEM", e))?;
 
     let encoding_key = EncodingKey::from_ec_pem(pkcs8_pem.as_bytes())
-        .map_err(|e| {
-            println!("[docker-token] ❌ EncodingKey::from_ec_pem failed: {:?}", e);
-            rocket::http::Status::InternalServerError
-        })?;
-
-    println!("[docker-token] ✅ EncodingKey created");
+        .map_err(|e| ApiError::internal("generate_docker_token: building EC encoding key", e))?;
 
     let access: Vec<DockerAccess> = scope
         .unwrap_or("")
@@ -1964,12 +2230,14 @@ fn generate_docker_token(
                     actions,
                 })
             } else {
+                eprintln!(
+                    "[WARN] generate_docker_token: skipping malformed scope segment '{}'",
+                    s
+                );
                 None
             }
         })
         .collect();
-
-    println!("[docker-token] ✅ access scopes parsed: {:?}", access);
 
     let now = Utc::now().timestamp() as usize;
     let jti: String = rand::thread_rng()
@@ -1978,11 +2246,10 @@ fn generate_docker_token(
         .map(char::from)
         .collect();
 
-    let issuer = env::var("DOCKER_TOKEN_ISSUER")
-        .unwrap_or_else(|_| {
-            println!("[docker-token] ⚠️  DOCKER_TOKEN_ISSUER not set, using default");
-            "my-auth-server".to_string()
-        });
+    let issuer = env::var("DOCKER_TOKEN_ISSUER").unwrap_or_else(|_| {
+        eprintln!("[WARN] generate_docker_token: DOCKER_TOKEN_ISSUER not set, using default");
+        "my-auth-server".to_string()
+    });
 
     let claims = DockerTokenClaims {
         iss: issuer,
@@ -1995,28 +2262,18 @@ fn generate_docker_token(
         access,
     };
 
-    // Check 4: JWT encode
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(kid);
     header.typ = Some("JWT".to_string());
 
-    let token = match encode(&header, &claims, &encoding_key) {
-        Ok(t) => {
-            println!("[docker-token] ✅ JWT encoded successfully");
-            t
-        }
-        Err(e) => {
-            println!("[docker-token] ❌ JWT encode failed: {:?}", e);
-            return Err(rocket::http::Status::InternalServerError);
-        }
-    };
+    let token = encode(&header, &claims, &encoding_key)
+        .map_err(|e| ApiError::internal("generate_docker_token: encoding JWT", e))?;
 
     Ok(DockerTokenResponse {
         token,
         expires_in: 300,
     })
 }
-
 
 #[openapi()]
 #[get("/docker-token?<service>&<scope>&<account>")]
@@ -2025,7 +2282,7 @@ pub fn get_docker_token(
     service: String,
     scope: Option<String>,
     account: Option<String>,
-) -> Result<Json<DockerTokenResponse>, rocket::http::Status> {
+) -> Result<Json<DockerTokenResponse>, ApiError> {
     // Use authenticated subject, fall back to account param, then anonymous
     let subject = if !auth.subject.is_empty() {
         auth.subject
