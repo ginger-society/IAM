@@ -91,7 +91,7 @@ pub struct InviteRequest {
     pub first_name: String,
     pub last_name: String,
     pub middle_name: Option<String>,
-    pub email: String,
+    pub email_id: String,
     pub is_root: bool,
 }
 

@@ -1857,7 +1857,7 @@ pub fn accept_invite(
         first_name: Some(invite_request.first_name),
         last_name: Some(invite_request.last_name),
         middle_name: invite_request.middle_name,
-        email_id: invite_request.email.clone(),
+        email_id: invite_request.email_id.clone(),
         mobile_number: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -1871,7 +1871,7 @@ pub fn accept_invite(
         .execute(&mut conn)
         .map_err(|e| {
             ApiError::internal(
-                &format!("accept_invite: inserting new user '{}'", invite_request.email),
+                &format!("accept_invite: inserting new user '{}'", invite_request.email_id),
                 e,
             )
         })?;
