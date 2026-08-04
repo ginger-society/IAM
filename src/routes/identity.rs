@@ -926,31 +926,67 @@ pub fn get_group_ownserships(claims: Claims, groups_owned: GroupOwnerships) -> J
 }
 
 #[openapi]
-#[get("/clear-redis")]
+#[get("/clear-redis?<email>")]
 pub fn clear_redis(
     claims: Claims,
+    rdb: &State<Pool<ConnectionManager<PgConnection>>>,
     cache_pool: &State<Pool<RedisConnectionManager>>,
-) -> Result<Json<String>, ApiError> {
+    email: Option<String>,
+) -> Result<Json<Value>, ApiError> {
     let mut cache_connection = get_cache_conn(cache_pool, "clear_redis")?;
 
-    let cache_key = format!("user_groups:{}", claims.user_id);
-    let cache_key_2 = format!("groups_owned:{}", claims.user_id);
+    // Resolve which user's cache to clear: the requested email if given,
+    // otherwise the caller's own user_id (previous behavior).
+    let target_user_id: String = if let Some(ref target_email) = email {
+        use crate::models::schema::schema::user::dsl::*;
+        let mut conn = get_conn(rdb, "clear_redis")?;
+
+        let u: User = user
+            .filter(email_id.eq(target_email))
+            .first(&mut conn)
+            .map_err(|e| {
+                ApiError::from_err(
+                    Status::NotFound,
+                    &format!("clear_redis: user with email '{}' not found", target_email),
+                    e,
+                )
+            })?;
+
+        u.id.to_string()
+    } else {
+        claims.user_id.clone()
+    };
+
+    let cache_key = format!("user_groups:{}", target_user_id);
+    let cache_key_2 = format!("groups_owned:{}", target_user_id);
+
+    // Fetch existing values BEFORE deleting, for debug visibility.
+    let existing_groups: Option<String> = cache_connection.get(&cache_key).map_err(|e| {
+        ApiError::internal(&format!("clear_redis: reading key '{}'", cache_key), e)
+    })?;
+    let existing_groups_owned: Option<String> = cache_connection.get(&cache_key_2).map_err(|e| {
+        ApiError::internal(&format!("clear_redis: reading key '{}'", cache_key_2), e)
+    })?;
 
     cache_connection.del::<_, i32>(&cache_key).map_err(|e| {
-        ApiError::internal(
-            &format!("clear_redis: deleting key '{}'", cache_key),
-            e,
-        )
+        ApiError::internal(&format!("clear_redis: deleting key '{}'", cache_key), e)
     })?;
 
     cache_connection.del::<_, i32>(&cache_key_2).map_err(|e| {
-        ApiError::internal(
-            &format!("clear_redis: deleting key '{}'", cache_key_2),
-            e,
-        )
+        ApiError::internal(&format!("clear_redis: deleting key '{}'", cache_key_2), e)
     })?;
 
-    Ok(Json("Successfully cleared Redis cache.".to_string()))
+    Ok(Json(json!({
+        "status": "success",
+        "message": format!("Successfully cleared Redis cache for user id {}.", target_user_id),
+        "user_id": target_user_id,
+        "existing_groups": existing_groups
+            .as_deref()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap_or(json!(s))),
+        "existing_groups_owned": existing_groups_owned
+            .as_deref()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap_or(json!(s))),
+    })))
 }
 
 #[openapi()]
