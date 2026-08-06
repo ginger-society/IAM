@@ -60,6 +60,14 @@ use sec1::DecodeEcPrivateKey;
 use crate::models::request::DockerAccess;
 use p256::pkcs8::EncodePrivateKey;
 
+
+// Near the top of the file, with the other constants/imports
+const REFRESH_TOKEN_HOURS: i64 = 10;
+
+fn refresh_token_duration() -> Duration {
+    Duration::hours(REFRESH_TOKEN_HOURS)
+}
+
 // ============================================================================
 // Shared, descriptive JSON error type — mirrors the ApiError used in the
 // dbschema/services router so both services return a consistent error shape:
@@ -633,7 +641,7 @@ pub fn login(
                     .set_ex(
                         refresh_token.clone(),
                         session_data_with_app.to_string(),
-                        3600,
+                        refresh_token_duration().num_seconds() as usize,
                     )
                     .map_err(|e| {
                         ApiError::internal(
@@ -692,7 +700,7 @@ pub fn login(
         .set_ex(
             refresh_token_without_app.clone(),
             session_data_without_app.to_string(),
-            3600,
+            refresh_token_duration().num_seconds() as usize,
         )
         .map_err(|e| {
             ApiError::internal(
@@ -802,8 +810,8 @@ fn create_jwt(
     c_id: &Option<String>,
 ) -> Result<String, ApiError> {
     let expiration = match token_type {
-        "access" => Utc::now() + Duration::minutes(15), // Short-lived access token
-        "refresh" => Utc::now() + Duration::hours(10),  // Longer-lived refresh token
+        "access" => Utc::now() + Duration::minutes(15),
+        "refresh" => Utc::now() + refresh_token_duration(),
         other => {
             return Err(ApiError::internal(
                 "create_jwt: invalid token_type requested",
@@ -2050,7 +2058,7 @@ pub fn generate_app_tokens(
         "app_id": app_id,
     });
     let _: () = cache_connection
-        .set_ex(refresh_token.clone(), session_data.to_string(), 3600)
+        .set_ex(refresh_token.clone(), session_data.to_string(), refresh_token_duration().num_seconds() as usize)
         .map_err(|e| {
             ApiError::internal(
                 &format!("generate_app_tokens: caching session for app '{}'", app_id),
